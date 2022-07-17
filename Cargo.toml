@@ -1,0 +1,16 @@
+[package]
+name = "regolith-displayd"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4"
+pretty_env_logger = "0.4.0"
+tokio = { version = "1", features = ["full"]}
+zbus = { version = "2", default-features = false, features = ["tokio"] }
+serde = "1.0.139"
+zvariant = "3.4.1"
+swayipc-async = "2.0.0"
+event-listener = "2.5.2"

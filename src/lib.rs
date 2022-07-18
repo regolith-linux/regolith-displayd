@@ -3,8 +3,8 @@ pub mod monitor;
 
 use log::{error, info};
 use monitor::{LogicalMonitor, Monitor};
+use serde::{Deserialize, Serialize};
 use std::{
-    borrow::BorrowMut,
     error::Error,
     fs::{self, File},
     io::Read,
@@ -19,18 +19,18 @@ use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
 /// Stores configrations, interacts with sway IPC and monitors hardware changes
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct DisplayManager {
     serial: u32,
     monitors: Vec<Monitor>,
     logical_monitors: Vec<LogicalMonitor>,
     properties: DisplayManagerProperties,
-    sway_connection: Connection,
 }
 
 /// DBus Interface for providing bindings
 pub struct DisplayServer {
     manager: Arc<Mutex<DisplayManager>>,
+    sway_connection: Arc<Mutex<Connection>>,
 }
 
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type)]
@@ -48,32 +48,50 @@ pub struct DisplayManagerProperties {
 
 #[dbus_interface(name = "org.gnome.Mutter.DisplayConfig")]
 impl DisplayServer {
-    #[dbus_interface(out_args("serial", "monitors", "logical_monitors", "properties"))]
-    pub async fn get_current_state(
-        &mut self,
-    ) -> (
-        u32,
-        Vec<Monitor>,
-        Vec<LogicalMonitor>,
-        DisplayManagerProperties,
-    ) {
+    pub async fn get_current_state(&mut self) -> DisplayManager {
         info!("Recieved 'GetCurrentState' request from control-center");
-        let mut manager_ref = self.manager.borrow_mut().lock().await;
-        let DisplayManager {
-            serial,
-            monitors,
-            properties,
-            logical_monitors,
-            ..
-        } = &*manager_ref;
-        let response = (
-            serial.clone(),
-            monitors.clone(),
-            logical_monitors.clone(),
-            properties.clone(),
-        );
-        manager_ref.serial += 1;
-        response
+        let manager_ref = self.manager.lock().await;
+        manager_ref.clone()
+    }
+
+    pub async fn apply_monitors_config(
+        &mut self,
+        serial: u32,
+        method: u32,
+        logical_monitors: Vec<LogicalMonitor>,
+        properties: DisplayManagerProperties,
+    ) -> zbus::fdo::Result<()> {
+        error!("Configuration Method: {method}");
+        let mut manager_obj = self.manager.lock().await;
+        if serial != manager_obj.serial {
+            panic!("Wrong serial");
+        }
+        for monitor in &logical_monitors {
+            monitor.apply(&self.sway_connection).await;
+        }
+        manager_obj
+            .get_monitor_info(&self.sway_connection)
+            .await
+            .unwrap();
+        manager_obj.properties = properties;
+        Ok(())
+    }
+
+    #[dbus_interface(property)]
+    pub async fn apply_monitors_config_allowed(&self) -> bool {
+        error!("Call to apply_monitors_config");
+        return true;
+    }
+
+    pub fn apply_configuration(&self) {
+        error!("Applying config");
+    }
+
+    pub fn get_resources(&self) {
+        error!("GetRresources");
+    }
+    pub fn change_backlight(&self) {
+        error!("GetRresources");
     }
 
     #[dbus_interface(signal)]
@@ -81,12 +99,22 @@ impl DisplayServer {
 }
 
 impl DisplayServer {
-    pub fn new(manager: Arc<Mutex<DisplayManager>>) -> DisplayServer {
-        DisplayServer { manager }
+    pub async fn new(
+        manager: Arc<Mutex<DisplayManager>>,
+        sway_connection: Arc<Mutex<Connection>>,
+    ) -> DisplayServer {
+        DisplayServer {
+            manager,
+            sway_connection,
+        }
     }
     pub async fn run_server(self) -> Result<zbus::Connection, Box<dyn Error>> {
         info!("Starting display daemon");
-        self.manager.lock().await.get_monitor_info().await?;
+        self.manager
+            .lock()
+            .await
+            .get_monitor_info(&self.sway_connection)
+            .await?;
         let connection = ConnectionBuilder::session()?
             .name("org.gnome.Mutter.DisplayConfig")?
             .serve_at("/org/gnome/Mutter/DisplayConfig", self)?
@@ -97,19 +125,18 @@ impl DisplayServer {
 }
 impl DisplayManager {
     pub async fn new() -> DisplayManager {
-        let sway_connection = Connection::new().await.expect("Unable to connect to sway ipc interface. Make sure sway is running and SWAYSOCK is set");
         DisplayManager {
             serial: 0,
             monitors: Vec::new(),
             logical_monitors: Vec::new(),
             properties: DisplayManagerProperties::new(),
-            sway_connection,
         }
     }
     /// Watch for monitor changes.
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
         connection: &zbus::Connection,
+        sway_connection: Arc<Mutex<Connection>>,
     ) -> Result<(), Box<dyn Error>> {
         let prefix = "card0-";
         let get_status = |path: &PathBuf| {
@@ -145,9 +172,16 @@ impl DisplayManager {
                 let curr_status = get_status(&output.0);
                 if curr_status != output.1 {
                     info!("Displays changed...");
-                    if let Err(e) = manager_obj_ref.lock().await.get_monitor_info().await {
+                    info!("Display Status: {:?}", outputs);
+                    if let Err(e) = manager_obj_ref
+                        .lock()
+                        .await
+                        .get_monitor_info(&sway_connection)
+                        .await
+                    {
                         error!("{e}");
                     };
+                    info!("Emiting MonitorsChanged signal...");
                     connection
                         .emit_signal(
                             Some("org.gnome.Mutter.DisplayConfig"),
@@ -165,8 +199,11 @@ impl DisplayManager {
         }
     }
 
-    async fn get_monitor_info(&mut self) -> Result<(), Box<dyn Error>> {
-        let outputs = self.sway_connection.get_outputs().await?;
+    async fn get_monitor_info<'a>(
+        &mut self,
+        sway_connection: &Mutex<Connection>,
+    ) -> Result<(), Box<dyn Error>> {
+        let outputs = sway_connection.lock().await.get_outputs().await?;
         self.monitors = outputs.iter().map(|o| Monitor::new(o)).collect();
         self.logical_monitors = outputs.iter().map(|o| LogicalMonitor::new(o)).collect();
         info!("monitors info: {:#?}", self.monitors);

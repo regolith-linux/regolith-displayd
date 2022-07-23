@@ -1,10 +1,17 @@
-use std::sync::Arc;
-
 use crate::modes::Modes;
+use log::{debug, error, warn};
+use num;
+use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
+use std::{error::Error, sync::Arc};
 use swayipc_async::{Connection, Output};
 use tokio::sync::Mutex;
+use zbus::fdo::Error::{self as ZError, Failed};
 use zvariant::{DeserializeDict, SerializeDict, Type};
+
+trait Apply {
+    fn apply() -> Result<(), Box<dyn Error>>;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Monitor {
@@ -41,6 +48,7 @@ pub struct MonitorProperties {
     name: Option<String>,
 }
 
+#[derive(FromPrimitive)]
 pub enum MonitorTransform {
     Normal = 0,
     Left = 1,
@@ -54,7 +62,22 @@ pub enum MonitorTransform {
 
 #[derive(Debug, PartialEq, Eq, Clone, DeserializeDict, SerializeDict, Type)]
 #[zvariant(signature = "dict")]
-pub struct LogicalMonitorProperties;
+pub struct LogicalMonitorProperties {
+    #[zvariant(rename = "dummy")]
+    dummy: Option<i32>,
+    #[zvariant(rename = "dummy2")]
+    dummy2: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct MonitorApply {
+    x_pos: i32,
+    y_pos: i32,
+    scale: f64,
+    transform: u32,
+    primary: bool, // false always for wayland
+    monitors: Vec<(String, String, MonitorProperties)>,
+}
 
 impl Monitor {
     pub fn new(output: &Output) -> Monitor {
@@ -70,6 +93,15 @@ impl Monitor {
             modes: output_modes,
             properties: MonitorProperties::new(output),
         }
+    }
+
+    pub fn search_modes(&self, mode_id: &str) -> Option<&Modes> {
+        self.modes.iter().find(|&m| m.get_id() == mode_id)
+    }
+
+    pub fn get_dpy_name(&self) -> String {
+        let desc = &self.description;
+        format!("{} {} {}", desc.1, desc.2, desc.3)
     }
 }
 
@@ -90,6 +122,41 @@ impl MonitorProperties {
     }
 }
 
+impl MonitorTransform {
+    pub fn from_u32(transform: u32) -> Option<MonitorTransform> {
+        num::FromPrimitive::from_u32(transform)
+    }
+    pub fn from_sway(sway_transform: &Option<String>) -> MonitorTransform {
+        match sway_transform {
+            Some(str) => match str.as_str() {
+                "90" => MonitorTransform::Left,
+                "180" => MonitorTransform::Down,
+                "270" => MonitorTransform::Right,
+                "flipped" => MonitorTransform::Flipped,
+                "flipped-90" => MonitorTransform::FlippedLeft,
+                "flipped-180" => MonitorTransform::FlippedDown,
+                "flipped-270" => MonitorTransform::FlippedRight,
+                _ => MonitorTransform::Normal,
+            },
+            _ => MonitorTransform::Normal,
+        }
+    }
+
+    pub fn to_sway(self) -> &'static str {
+        use MonitorTransform::*;
+        match self {
+            Normal => "normal",
+            Left => "90",
+            Down => "180",
+            Right => "270",
+            Flipped => "flipped",
+            FlippedLeft => "flipped-90",
+            FlippedDown => "flipped-180",
+            FlippedRight => "flipped-270",
+        }
+    }
+}
+
 impl LogicalMonitor {
     pub fn new(output: &Output) -> LogicalMonitor {
         let monitor = [(
@@ -98,53 +165,112 @@ impl LogicalMonitor {
             output.model.clone(),  // product
             output.serial.clone(), // serial
         )];
+        let scale = match output.scale {
+            Some(s) => s,
+            None => {
+                warn!("Cannot get scale value.");
+                1.0
+            }
+        };
+        let transform = MonitorTransform::from_sway(&output.transform) as u32;
         LogicalMonitor {
+            scale,
             monitors: monitor.to_vec(),
-            scale: output.scale.unwrap_or(1f64),
             primary: output.primary,
-            transform: 0,
+            transform,
             x_pos: output.rect.x,
             y_pos: output.rect.y,
-            properties: LogicalMonitorProperties {},
+            properties: LogicalMonitorProperties {
+                // Dummy data to emulate a{sv}
+                dummy: None,
+                dummy2: None,
+            },
         }
     }
-    fn get_sway_dpy_name(&self) -> String {
-        let curr_monitor = self
-            .monitors
-            .get(0)
-            .expect("No monitors for logical monitor...");
-        let display_name = format!(
-            "\"{} {} {}\"",
-            curr_monitor.1, curr_monitor.2, curr_monitor.3
+}
+
+impl MonitorApply {
+    fn build_pos_cmd(&self, monitor: &Monitor) -> String {
+        let dpy_name = monitor.get_dpy_name();
+        format!("output '{}' pos {} {}", dpy_name, self.x_pos, self.y_pos)
+    }
+
+    fn build_mode_cmd(&self, monitor: &Monitor) -> Option<String> {
+        let dpy_name = monitor.get_dpy_name();
+        let modestr = &self.monitors[0].1;
+        let mode = match monitor.search_modes(&modestr) {
+            Some(x) => x,
+            None => {
+                error!("Invalid mode.");
+                return None;
+            }
+        };
+        Some(format!("output '{}' mode {}", dpy_name, mode.get_modestr()))
+    }
+
+    fn build_scale_cmd(&self, monitor: &Monitor) -> String {
+        let dpy_name = monitor.get_dpy_name();
+        format!("output '{dpy_name}' scale {}", self.scale)
+    }
+
+    fn build_transfor_cmd(&self, monitor: &Monitor) -> Option<String> {
+        let dpy_name = monitor.get_dpy_name();
+        let transform = MonitorTransform::from_u32(self.transform)?;
+        Some(format!(
+            "output '{dpy_name}' transform {}",
+            transform.to_sway()
+        ))
+    }
+
+    fn search_monitor<'a>(&self, monitors: &'a Vec<Monitor>) -> Option<&'a Monitor> {
+        monitors
+            .iter()
+            .find(|mon| mon.description.0 == self.monitors[0].0)
+    }
+
+    pub async fn apply(&self, sway_connect: &Arc<Mutex<Connection>>, monitors: &Vec<Monitor>) {
+        debug!(
+            "Entered fn apply for monitor - {}",
+            monitors[0].description.0
         );
-        display_name
-    }
-
-    fn build_pos_cmd(&self) -> String {
-        let dpy_name = self.get_sway_dpy_name();
-        format!("output {} pos {} {}", dpy_name, self.x_pos, self.y_pos)
-    }
-
-    fn _build_mode_cmd(&self) -> String {
-        let dpy_name = self.get_sway_dpy_name();
-        // format!("output {} mode {}x{}@{}", dpy_name,)
-        dpy_name
-    }
-
-    fn build_scale_cmd(&self) -> String {
-        let dpy_name = self.get_sway_dpy_name();
-        format!("output {dpy_name} scale {}", self.scale)
-    }
-
-    pub async fn apply(&self, sway_connect: &Arc<Mutex<Connection>>) {
-        let cmds = [self.build_pos_cmd(), self.build_scale_cmd()];
+        let monitor = self.search_monitor(monitors).unwrap();
+        let cmds = [
+            self.build_pos_cmd(monitor),
+            self.build_scale_cmd(monitor),
+            self.build_mode_cmd(monitor).unwrap(),
+            self.build_transfor_cmd(monitor).unwrap(),
+        ];
+        let mut connection = sway_connect.lock().await;
         for cmd in cmds {
-            sway_connect
-                .lock()
-                .await
+            debug!("Running command: {}", cmd);
+            connection
                 .run_command(cmd)
                 .await
                 .expect("Failed to run command {cmd}");
         }
+    }
+
+    pub fn verify(
+        &self,
+        _sway_connect: &Arc<Mutex<Connection>>,
+        monitors: &Vec<Monitor>,
+    ) -> zbus::fdo::Result<()> {
+        let monitor = self
+            .search_monitor(monitors)
+            .ok_or(Failed(String::from("Monitor not found")))?;
+        self.build_mode_cmd(monitor)
+            .ok_or(ZError::InvalidArgs(String::from("Invalid position")))?;
+        let mode = monitor
+            .search_modes(&self.monitors[0].1)
+            .ok_or(ZError::InvalidArgs(String::from(
+                "Invalid resolution / refresh rate",
+            )))?;
+        if !mode.is_valid_scale(self.scale) {
+            return Err(ZError::InvalidArgs(String::from("Invalid scale")));
+        }
+        if self.build_transfor_cmd(monitor) == None {
+            return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
+        }
+        Ok(())
     }
 }

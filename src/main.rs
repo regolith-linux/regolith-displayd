@@ -16,10 +16,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sway_connection_ref = Arc::new(Mutex::new(sway_connection));
     let server =
         DisplayServer::new(Arc::clone(&manager_ref), Arc::clone(&sway_connection_ref)).await;
-    let connection = server.run_server().await.unwrap();
+    server.run_server().await.unwrap();
 
     let watch_handle = tokio::spawn(async move {
-        DisplayManager::watch_changes(manager_ref, &connection, sway_connection_ref)
+        DisplayManager::watch_changes(manager_ref, sway_connection_ref)
             .await
             .unwrap();
     });

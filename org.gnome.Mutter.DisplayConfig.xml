@@ -1,4 +1,6 @@
-<!DOCTYPE node PUBLIC '-//freedesktop//DTD D-BUS Object Introspection 1.0//EN' 'http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd'>
+<!DOCTYPE node PUBLIC
+'-//freedesktop//DTD D-BUS Object Introspection 1.0//EN'
+'http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd'>
 <node>
   <!--
       org.gnome.Mutter.DisplayConfig:
@@ -289,6 +291,20 @@
     <property name="PanelOrientationManaged" type="b" access="read" />
 
     <!--
+        ApplyMonitorsConfigAllowed:
+
+        Whether calling the ApplyMonitorsConfig method is allowed.
+    -->
+    <property name="ApplyMonitorsConfigAllowed" type="b" access="read" />
+
+    <!--
+        NightLightSupported:
+
+        Whether night light is supported by this system.
+    -->
+    <property name="NightLightSupported" type="b" access="read" />
+
+    <!--
         MonitorsChanged:
 
 	The signal is emitted every time the screen configuration
@@ -334,6 +350,12 @@
 				laptop panel (absence of this means it is
 				not built in)
 	    - "display-name" (s): a human readable display name of the monitor
+	    - "privacy-screen-state" (bb): the state of the privacy screen
+				     (absence of this means it is not being
+				     supported) first value indicates whether
+				     it's enabled and second value whether it's
+				     hardware locked (and so can't be changed
+				     via gsettings)
 
         Possible mode flags:
 	  1 : preferred mode

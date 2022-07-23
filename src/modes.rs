@@ -25,6 +25,10 @@ pub struct ModeProperties {
 }
 
 impl Modes {
+    pub fn get_id(&self) -> &str {
+        &self.id
+    }
+
     pub fn new(output: &Output, mode_info: &SwayMode) -> Modes {
         let SwayMode {
             height,
@@ -33,7 +37,7 @@ impl Modes {
             ..
         } = *mode_info;
         let is_current = match &output.current_mode {
-            Some(x) => x == mode_info,
+            Some(x) => Self::is_current_mode(x, mode_info),
             _ => false,
         };
 
@@ -42,13 +46,13 @@ impl Modes {
             interlaced: Some(false),
             preferred: Some(false),
         };
-        let supported_scales = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0].to_vec();
+        let supported_scales = [1.0, 2.0].to_vec();
         Modes {
             width,
             height,
             supported_scales,
             id: format!(
-                "{}x{} @ {}",
+                "{}x{}@{}Hz",
                 mode_info.width,
                 mode_info.height,
                 mode_info.refresh as f64 / 1000f64
@@ -57,5 +61,16 @@ impl Modes {
             refresh_rate: refresh as f64 / 1000f64,
             properties,
         }
+    }
+    pub fn get_modestr(&self) -> &str {
+        &self.id
+    }
+    pub fn is_valid_scale(&self, scale: f64) -> bool {
+        self.supported_scales.contains(&scale)
+    }
+    pub fn is_current_mode(actual: &SwayMode, current: &SwayMode) -> bool {
+        current.height == actual.height
+            && current.width == actual.width
+            && current.refresh == actual.refresh
     }
 }

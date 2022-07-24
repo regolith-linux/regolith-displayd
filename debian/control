@@ -1,0 +1,15 @@
+Source: regolith
+Section: unknown
+Priority: optional
+Maintainer: Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>
+Build-Depends: cargo, libglib2.0-dev, debhelper-compat
+Standards-Version: 4.5.0
+Homepage: <https://github.com/regolith-linux/regolith-displayd>
+
+Package: regolith
+Architecture: any
+Multi-Arch: foreign
+Depends: ${misc:Depends}, ${shlibs:Depends}, kanshi
+Description: Daemon for enabling inter-op between 
+  gnome-control-center display panel and sway 
+  by providing relevant dbus bindings

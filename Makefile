@@ -23,4 +23,4 @@ clean:
 	cargo clean
 
 install:
-	$(INSTALL) "./target/release/regolith-displayd" "$(install_loc)/"
+	$(INSTALL_BIN) "./target/release/regolith-displayd" "$(install_loc)/"

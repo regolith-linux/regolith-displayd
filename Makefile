@@ -1,5 +1,4 @@
-INSTALL = install 
-INSTALL_BIN = $(INSTALL) -D -m 0755
+INSTALL_PROGRAM = install -D -m 0755
 install_loc = ${DESTDIR}/usr/bin
 
 all: build
@@ -23,4 +22,5 @@ clean:
 	cargo clean
 
 install:
-	$(INSTALL_BIN) "./target/release/regolith-displayd" "$(install_loc)/"
+	mkdir -p $(install_loc)
+	$(INSTALL_PROGRAM) "./target/release/regolith-displayd" "$(install_loc)/"

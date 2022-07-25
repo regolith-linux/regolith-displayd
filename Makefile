@@ -1,6 +1,8 @@
 INSTALL = install -D -m 0755
 install_loc = ${DESTDIR}/usr/bin
 
+all: build
+
 distclean: clean
 
 binary: binary-arch binary-indep

@@ -23,7 +23,7 @@ build:
 clean:
 	cargo clean
 
-install:
-	mkdir -p $(install_loc)
-	sudo $(INSTALL_PROGRAM) "./target/release/regolith-displayd" "$(install_loc)/"
-	sudo $(INSTALL_DATA) "./regolith-displayd.service" "$(service_loc)/regolith-displayd.service"
+#install:
+#	mkdir -p $(install_loc)
+#	sudo $(INSTALL_PROGRAM) "./target/release/regolith-displayd" "$(install_loc)/"
+#	sudo $(INSTALL_DATA) "./regolith-displayd.service" "$(service_loc)/regolith-displayd.service"

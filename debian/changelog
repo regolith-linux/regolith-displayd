@@ -1,3 +1,9 @@
+regolith-displayd (0.1-2) focal; urgency=medium
+
+  * Update packaging
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 13 Aug 2022 12:48:03 -0700
+
 regolith-displayd (0.1) focal; urgency=low
 
   * Initial release. 

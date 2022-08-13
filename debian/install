@@ -1,0 +1,2 @@
+regolith-displayd.service /usr/lib/systemd/user/
+target/release/regolith-displayd /usr/bin/

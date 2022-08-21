@@ -4,6 +4,7 @@ Upstream-Contact: <https://github.com/regolith-linux/regolith-displayd>
 Source: <https://github.com/regolith-linux/regolith-displayd>
 
 Files: *
+Copyright: 2022 Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>
 License: Apache-2.0
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.

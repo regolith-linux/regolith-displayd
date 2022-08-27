@@ -232,7 +232,11 @@ impl DisplayManager {
     ) -> Result<(), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
         self.monitors = outputs.iter().map(|o| Monitor::new(o)).collect();
-        self.logical_monitors = outputs.iter().map(|o| LogicalMonitor::new(o)).collect();
+        self.logical_monitors = outputs
+            .iter()
+            .filter(|o| o.active)
+            .map(|o| LogicalMonitor::new(o))
+            .collect();
         info!("monitors info: {:#?}", self.monitors);
         info!("logical monitors: {:#?}", self.logical_monitors);
         Ok(())

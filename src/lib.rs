@@ -156,7 +156,7 @@ impl DisplayManager {
         sway_connection: Arc<Mutex<Connection>>,
     ) -> Result<(), Box<dyn Error>> {
         let prefix = "card";
-        let get_status = |path: &PathBuf| {
+        let get_monitor_state = |path: &PathBuf| {
             let mut status = String::from("Off");
             let status_path = path.join("dpms");
             if status_path.exists() {
@@ -165,7 +165,15 @@ impl DisplayManager {
                     .read_to_string(&mut status)
                     .unwrap();
             }
-            status
+            let enabled_path = path.join("enabled");
+            let mut enabled = String::from("disabled");
+            if enabled_path.exists() {
+                File::open(enabled_path)
+                    .unwrap()
+                    .read_to_string(&mut enabled)
+                    .unwrap();
+            }
+            (status, enabled)
         };
         let get_outputs = || -> Vec<_> {
             let outputs = fs::read_dir("/sys/class/drm/")
@@ -174,7 +182,7 @@ impl DisplayManager {
                 .filter(|item| item.file_name().to_str().unwrap().starts_with(prefix))
                 .map(|item| item.path())
                 .map(|path| {
-                    let status = get_status(&path);
+                    let status = get_monitor_state(&path);
                     (path, status)
                 })
                 .collect();
@@ -187,7 +195,7 @@ impl DisplayManager {
             outputs = get_outputs();
             thread::sleep(Duration::from_millis(500));
             for output in &*outputs {
-                let curr_status = get_status(&output.0);
+                let curr_status = get_monitor_state(&output.0);
                 if curr_status != output.1 {
                     debug!("Change Detected");
                     info!("Displays changed...");

@@ -193,7 +193,7 @@ impl DisplayManager {
         loop {
             let manager_obj_ref = Arc::clone(&manager_obj);
             outputs = get_outputs();
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(600));
             for output in &*outputs {
                 let curr_status = get_monitor_state(&output.0);
                 if curr_status != output.1 {
@@ -212,9 +212,7 @@ impl DisplayManager {
                     info!("Emiting MonitorsChanged signal...");
                     break;
                 }
-                thread::sleep(Duration::from_millis(50));
             }
-            thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -239,7 +237,11 @@ impl DisplayManager {
         sway_connection: &Mutex<Connection>,
     ) -> Result<(), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
-        self.monitors = outputs.iter().map(|o| Monitor::new(o)).collect();
+        self.monitors = outputs
+            .iter()
+            .filter(|o| o.active)
+            .map(|o| Monitor::new(o))
+            .collect();
         self.logical_monitors = outputs
             .iter()
             .filter(|o| o.active)

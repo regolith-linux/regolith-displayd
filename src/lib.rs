@@ -6,6 +6,8 @@ use lazy_static::lazy_static;
 use log::{debug, error, info};
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::{
     error::Error,
     fs::{self, File},
@@ -79,17 +81,60 @@ impl DisplayServer {
         if serial != manager_obj.serial {
             panic!("Wrong serial");
         }
-        for monitor in &logical_monitors {
+        let get_dpy_name = |mon: &MonitorApply| {
+            let monitor = mon.search_monitor(&manager_obj.monitors).unwrap();
+            monitor.get_dpy_name().replace(" ", "_")
+        };
+
+        let mut monitors_sorted = logical_monitors.clone();
+        monitors_sorted.sort_by_key(get_dpy_name);
+        let profile_name = monitors_sorted
+            .iter()
+            .map(get_dpy_name)
+            .collect::<Vec<String>>()
+            .join("__");
+        debug!("Profile Name: {profile_name}");
+        let env_vars: HashMap<String, String> = std::env::vars().collect();
+        let home_dir = env_vars.get("HOME").expect("$HOME not defined");
+        let kanshi_base_path: PathBuf = env_vars
+            .get("KANSHI_PARTIALS")
+            .unwrap_or(&format!("{home_dir}/.config/regolith2/kanshi/output/"))
+            .into();
+
+        fs::create_dir_all(&kanshi_base_path).unwrap();
+        let mut profile_buf = File::options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(kanshi_base_path.join(&profile_name))
+            .expect("Error while opening profile file for writing");
+
+        writeln!(&mut profile_buf, "profile {{").unwrap();
+
+        let mut active_mons = Vec::new();
+        for logical_monitor in &logical_monitors {
             if method == 0 {
-                match monitor.verify(&self.sway_connection, &manager_obj.monitors) {
+                match logical_monitor.verify(&self.sway_connection, &manager_obj.monitors) {
                     Ok(_) => continue,
                     Err(e) => return Err(e),
                 };
             }
-            monitor
-                .apply(&self.sway_connection, &manager_obj.monitors)
-                .await;
+            let monitor = logical_monitor
+                .search_monitor(&manager_obj.monitors)
+                .unwrap();
+            active_mons.push(monitor);
+            logical_monitor.apply(&self.sway_connection, &monitor).await;
+            logical_monitor.save_kanshi(&mut profile_buf, &monitor);
         }
+        for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
+            writeln!(
+                &profile_buf,
+                "\toutput {} disable",
+                disabled_mon.get_dpy_name()
+            )
+            .expect("Failed to write to file");
+        }
+        writeln!(&mut profile_buf, "}}").unwrap();
         if method == 0 {
             return Ok(());
         }
@@ -216,6 +261,13 @@ impl DisplayManager {
         }
     }
 
+    fn get_disabled_monitors(&self, active_mons: &Vec<&Monitor>) -> Vec<&Monitor> {
+        self.monitors
+            .iter()
+            .filter(|mon| !active_mons.contains(mon))
+            .collect()
+    }
+
     pub async fn emit_monitors_changed() -> zbus::Result<()> {
         let connection = ZBUS_CONNECTION.lock().await;
         info!("Emiting monitor changed");
@@ -242,11 +294,7 @@ impl DisplayManager {
             .filter(|o| o.active)
             .map(|o| Monitor::new(o))
             .collect();
-        self.logical_monitors = outputs
-            .iter()
-            .filter(|o| o.active)
-            .map(|o| LogicalMonitor::new(o))
-            .collect();
+        self.logical_monitors = outputs.iter().map(|o| LogicalMonitor::new(o)).collect();
         info!("monitors info: {:#?}", self.monitors);
         info!("logical monitors: {:#?}", self.logical_monitors);
         Ok(())

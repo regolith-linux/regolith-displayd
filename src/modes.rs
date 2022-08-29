@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use swayipc_async::{Mode as SwayMode, Output};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
-#[derive(Debug, Clone, Deserialize, Serialize, Type)]
+#[derive(Debug, Clone, Deserialize, Serialize, Type, PartialEq)]
 pub struct Modes {
     id: String,
     width: i32,
@@ -13,7 +13,7 @@ pub struct Modes {
     properties: ModeProperties,
 }
 
-#[derive(Debug, Clone, DeserializeDict, SerializeDict, Type)]
+#[derive(Debug, Clone, DeserializeDict, SerializeDict, Type, PartialEq)]
 #[zvariant(signature = "dict")]
 pub struct ModeProperties {
     #[zvariant(rename = "is-current")]

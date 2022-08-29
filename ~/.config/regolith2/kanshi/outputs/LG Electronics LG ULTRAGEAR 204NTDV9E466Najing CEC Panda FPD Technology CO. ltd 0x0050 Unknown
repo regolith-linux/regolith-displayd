@@ -1,0 +1,10 @@
+profile {
+	output 'Najing CEC Panda FPD Technology CO. ltd 0x0050 Unknown' pos 0 1024
+	output 'Najing CEC Panda FPD Technology CO. ltd 0x0050 Unknown' scale 1
+	output 'Najing CEC Panda FPD Technology CO. ltd 0x0050 Unknown' mode 1920x1080@120.003Hz
+	output 'Najing CEC Panda FPD Technology CO. ltd 0x0050 Unknown' transform normal
+	output 'LG Electronics LG ULTRAGEAR 204NTDV9E466' pos 1920 0
+	output 'LG Electronics LG ULTRAGEAR 204NTDV9E466' scale 1
+	output 'LG Electronics LG ULTRAGEAR 204NTDV9E466' mode 2560x1440@96.005Hz
+	output 'LG Electronics LG ULTRAGEAR 204NTDV9E466' transform normal
+}

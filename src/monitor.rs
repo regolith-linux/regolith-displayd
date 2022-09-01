@@ -1,9 +1,10 @@
 use crate::modes::Modes;
-use log::{debug, warn};
+use log::{debug, warn, error};
 use num;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
+use std::hash::Hash;
 use std::io::Write;
 use std::{error::Error, sync::Arc};
 use swayipc_async::{Connection, Output};
@@ -15,7 +16,7 @@ trait Apply {
     fn apply() -> Result<(), Box<dyn Error>>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Monitor {
     description: (String, String, String, String),
     modes: Vec<Modes>,
@@ -105,7 +106,52 @@ impl Monitor {
         let desc = &self.description;
         format!("{} {} {}", desc.1, desc.2, desc.3)
     }
+
+    pub fn get_current_mode(&self) -> &str {
+        match self.modes.iter().find(|&mode| mode.current()) {
+            Some(m) => m.get_modestr(),
+            None => {
+                error!("Unable to find the currently active display mode");
+                "Unknown"
+            }
+        }
+    }
 }
+
+impl PartialEq for Monitor {
+    fn eq(&self, other: &Self) -> bool {
+        self.description == other.description 
+    }
+}
+
+impl PartialEq for LogicalMonitor {
+    fn eq(&self, other: &Self) -> bool {
+        self.x_pos == other.x_pos && self.y_pos == other.y_pos && self.scale == other.scale && self.transform == other.transform
+    }
+}
+
+impl Eq for Monitor {}
+
+impl Eq for LogicalMonitor {}
+
+impl Hash for Monitor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.description.hash(state);
+        self.get_current_mode().hash(state);
+    }
+}
+
+impl Hash for LogicalMonitor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.y_pos.hash(state);
+        self.x_pos.hash(state);
+        self.transform.hash(state);
+        let scale_int = (self.scale * 1000f64 ) as u32;
+        scale_int.hash(state);
+        self.monitors[0].hash(state);
+    }
+}
+
 
 impl MonitorProperties {
     pub fn new(output: &Output) -> MonitorProperties {
@@ -148,13 +194,13 @@ impl MonitorTransform {
         use MonitorTransform::*;
         match self {
             Normal => "normal",
-            Left => "90",
+            Right => "90",
             Down => "180",
-            Right => "270",
+            Left => "270",
             Flipped => "flipped",
-            FlippedLeft => "flipped-90",
+            FlippedRight => "flipped-90",
             FlippedDown => "flipped-180",
-            FlippedRight => "flipped-270",
+            FlippedLeft => "flipped-270",
         }
     }
 }

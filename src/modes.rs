@@ -73,4 +73,7 @@ impl Modes {
             && current.width == actual.width
             && current.refresh == actual.refresh
     }
+    pub fn current(&self) -> bool {
+        self.properties.current == Some(true)
+    }
 }

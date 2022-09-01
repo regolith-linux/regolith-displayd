@@ -1,20 +1,16 @@
 use crate::modes::Modes;
-use log::{debug, warn, error};
+use log::{warn, error};
 use num;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::hash::Hash;
 use std::io::Write;
-use std::{error::Error, sync::Arc};
+use std::{sync::Arc};
 use swayipc_async::{Connection, Output};
 use tokio::sync::Mutex;
 use zbus::fdo::Error::{self as ZError, Failed};
 use zvariant::{DeserializeDict, SerializeDict, Type};
-
-trait Apply {
-    fn apply() -> Result<(), Box<dyn Error>>;
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Monitor {
@@ -51,7 +47,7 @@ pub struct MonitorProperties {
     name: Option<String>,
 }
 
-#[derive(FromPrimitive)]
+#[derive(FromPrimitive, PartialEq, Eq)]
 pub enum MonitorTransform {
     Normal = 0,
     Left = 1,
@@ -245,33 +241,6 @@ impl MonitorApply {
             None => None,
         }
     }
-    fn build_pos_cmd(&self, monitor: &Monitor) -> String {
-        let dpy_name = monitor.get_dpy_name();
-        format!(
-            "output '{}' position {} {}",
-            dpy_name, self.x_pos, self.y_pos
-        )
-    }
-
-    fn build_mode_cmd(&self, monitor: &Monitor) -> Option<String> {
-        let dpy_name = monitor.get_dpy_name();
-        let mode = self.get_modestr(monitor)?;
-        Some(format!("output '{}' mode {}", dpy_name, mode))
-    }
-
-    fn build_scale_cmd(&self, monitor: &Monitor) -> String {
-        let dpy_name = monitor.get_dpy_name();
-        format!("output '{dpy_name}' scale {}", self.scale)
-    }
-
-    fn build_transform_cmd(&self, monitor: &Monitor) -> Option<String> {
-        let dpy_name = monitor.get_dpy_name();
-        let transform = MonitorTransform::from_u32(self.transform)?;
-        Some(format!(
-            "output '{dpy_name}' transform {}",
-            transform.to_sway()
-        ))
-    }
 
     pub fn search_monitor<'a>(&self, monitors: &'a Vec<Monitor>) -> Option<&'a Monitor> {
         monitors
@@ -299,24 +268,6 @@ impl MonitorApply {
         writeln!(kanshi_file, "\t{config}").unwrap();
     }
 
-    pub async fn apply(&self, sway_connect: &Arc<Mutex<Connection>>, monitor: &Monitor) {
-        debug!("Entered fn apply for monitor - {}", monitor.description.0);
-        let cmds = [
-            self.build_pos_cmd(monitor),
-            self.build_scale_cmd(monitor),
-            self.build_mode_cmd(monitor).unwrap(),
-            self.build_transform_cmd(monitor).unwrap(),
-        ];
-        let mut connection = sway_connect.lock().await;
-        for cmd in cmds {
-            warn!("Running command: {}", cmd);
-            connection
-                .run_command(cmd)
-                .await
-                .expect("Failed to run command {cmd}");
-        }
-    }
-
     pub fn verify(
         &self,
         _sway_connect: &Arc<Mutex<Connection>>,
@@ -325,17 +276,24 @@ impl MonitorApply {
         let monitor = self
             .search_monitor(monitors)
             .ok_or(Failed(String::from("Monitor not found")))?;
-        self.build_mode_cmd(monitor)
-            .ok_or(ZError::InvalidArgs(String::from("Invalid position")))?;
+
+        // Check if position is valid
+        if self.get_modestr(monitor) == None {
+            return Err(ZError::InvalidArgs(String::from("Invalid position")));
+        }
+
+        // Check if mode is valid
         let mode = monitor
             .search_modes(&self.monitors[0].1)
             .ok_or(ZError::InvalidArgs(String::from(
                 "Invalid resolution / refresh rate",
             )))?;
+
         if !mode.is_valid_scale(self.scale) {
             return Err(ZError::InvalidArgs(String::from("Invalid scale")));
         }
-        if self.build_transform_cmd(monitor) == None {
+
+        if MonitorTransform::from_u32(self.transform) == None {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
         }
         Ok(())

@@ -1,17 +1,16 @@
 use crate::modes::Modes;
-use log::{debug, error, warn};
+use log::{warn, error};
 use num;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
-use std::{error::Error, sync::Arc};
+use std::fs::File;
+use std::hash::Hash;
+use std::io::Write;
+use std::{sync::Arc};
 use swayipc_async::{Connection, Output};
 use tokio::sync::Mutex;
 use zbus::fdo::Error::{self as ZError, Failed};
 use zvariant::{DeserializeDict, SerializeDict, Type};
-
-trait Apply {
-    fn apply() -> Result<(), Box<dyn Error>>;
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Monitor {
@@ -31,7 +30,7 @@ pub struct LogicalMonitor {
     properties: LogicalMonitorProperties,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, DeserializeDict, SerializeDict, Type)]
+#[derive(Debug, PartialEq, Eq, Clone, DeserializeDict, SerializeDict, Type, Hash)]
 #[zvariant(signature = "dict")]
 pub struct MonitorProperties {
     #[zvariant(rename = "width-mm")]
@@ -48,7 +47,7 @@ pub struct MonitorProperties {
     name: Option<String>,
 }
 
-#[derive(FromPrimitive)]
+#[derive(FromPrimitive, PartialEq, Eq)]
 pub enum MonitorTransform {
     Normal = 0,
     Left = 1,
@@ -76,7 +75,7 @@ pub struct MonitorApply {
     scale: f64,
     transform: u32,
     primary: bool, // false always for wayland
-    monitors: Vec<(String, String, MonitorProperties)>,
+    pub monitors: Vec<(String, String, MonitorProperties)>,
 }
 
 impl Monitor {
@@ -103,13 +102,58 @@ impl Monitor {
         let desc = &self.description;
         format!("{} {} {}", desc.1, desc.2, desc.3)
     }
+
+    pub fn get_current_mode(&self) -> &str {
+        match self.modes.iter().find(|&mode| mode.current()) {
+            Some(m) => m.get_modestr(),
+            None => {
+                error!("Unable to find the currently active display mode");
+                "Unknown"
+            }
+        }
+    }
 }
+
+impl PartialEq for Monitor {
+    fn eq(&self, other: &Self) -> bool {
+        self.description == other.description 
+    }
+}
+
+impl PartialEq for LogicalMonitor {
+    fn eq(&self, other: &Self) -> bool {
+        self.x_pos == other.x_pos && self.y_pos == other.y_pos && self.scale == other.scale && self.transform == other.transform
+    }
+}
+
+impl Eq for Monitor {}
+
+impl Eq for LogicalMonitor {}
+
+impl Hash for Monitor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.description.hash(state);
+        self.get_current_mode().hash(state);
+    }
+}
+
+impl Hash for LogicalMonitor {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.y_pos.hash(state);
+        self.x_pos.hash(state);
+        self.transform.hash(state);
+        let scale_int = (self.scale * 1000f64 ) as u32;
+        scale_int.hash(state);
+        self.monitors[0].hash(state);
+    }
+}
+
 
 impl MonitorProperties {
     pub fn new(output: &Output) -> MonitorProperties {
         let name = Some(format!(
-            "{} '{} {} {}'",
-            &output.name, &output.make, &output.model, &output.serial
+            "{} {} {}",
+            &output.make, &output.model, &output.serial
         ));
         MonitorProperties {
             width: Some(output.rect.width),
@@ -146,13 +190,13 @@ impl MonitorTransform {
         use MonitorTransform::*;
         match self {
             Normal => "normal",
-            Left => "90",
+            Right => "90",
             Down => "180",
-            Right => "270",
+            Left => "270",
             Flipped => "flipped",
-            FlippedLeft => "flipped-90",
+            FlippedRight => "flipped-90",
             FlippedDown => "flipped-180",
-            FlippedRight => "flipped-270",
+            FlippedLeft => "flipped-270",
         }
     }
 }
@@ -190,64 +234,38 @@ impl LogicalMonitor {
 }
 
 impl MonitorApply {
-    fn build_pos_cmd(&self, monitor: &Monitor) -> String {
-        let dpy_name = monitor.get_dpy_name();
-        format!("output '{}' pos {} {}", dpy_name, self.x_pos, self.y_pos)
-    }
-
-    fn build_mode_cmd(&self, monitor: &Monitor) -> Option<String> {
-        let dpy_name = monitor.get_dpy_name();
+    fn get_modestr(&self, monitor: &Monitor) -> Option<String> {
         let modestr = &self.monitors[0].1;
-        let mode = match monitor.search_modes(&modestr) {
-            Some(x) => x,
-            None => {
-                error!("Invalid mode.");
-                return None;
-            }
-        };
-        Some(format!("output '{}' mode {}", dpy_name, mode.get_modestr()))
+        match monitor.search_modes(&modestr) {
+            Some(x) => Some(x.get_modestr().to_string()),
+            None => None,
+        }
     }
 
-    fn build_scale_cmd(&self, monitor: &Monitor) -> String {
-        let dpy_name = monitor.get_dpy_name();
-        format!("output '{dpy_name}' scale {}", self.scale)
-    }
-
-    fn build_transfor_cmd(&self, monitor: &Monitor) -> Option<String> {
-        let dpy_name = monitor.get_dpy_name();
-        let transform = MonitorTransform::from_u32(self.transform)?;
-        Some(format!(
-            "output '{dpy_name}' transform {}",
-            transform.to_sway()
-        ))
-    }
-
-    fn search_monitor<'a>(&self, monitors: &'a Vec<Monitor>) -> Option<&'a Monitor> {
+    pub fn search_monitor<'a>(&self, monitors: &'a Vec<Monitor>) -> Option<&'a Monitor> {
         monitors
             .iter()
             .find(|mon| mon.description.0 == self.monitors[0].0)
     }
 
-    pub async fn apply(&self, sway_connect: &Arc<Mutex<Connection>>, monitors: &Vec<Monitor>) {
-        debug!(
-            "Entered fn apply for monitor - {}",
-            monitors[0].description.0
+    pub fn save_kanshi(&self, kanshi_file: &mut File, monitor: &Monitor) {
+        let dpy_name = monitor.get_dpy_name();
+        let mode = match self.get_modestr(&monitor) {
+            Some(x) => x,
+            _ => return,
+        };
+        let transform =
+            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
+        let config = format!(
+            "output '{}' mode {} position {},{} transform {} scale {}",
+            dpy_name,
+            mode,
+            self.x_pos,
+            self.y_pos,
+            transform.to_sway(),
+            self.scale
         );
-        let monitor = self.search_monitor(monitors).unwrap();
-        let cmds = [
-            self.build_pos_cmd(monitor),
-            self.build_scale_cmd(monitor),
-            self.build_mode_cmd(monitor).unwrap(),
-            self.build_transfor_cmd(monitor).unwrap(),
-        ];
-        let mut connection = sway_connect.lock().await;
-        for cmd in cmds {
-            debug!("Running command: {}", cmd);
-            connection
-                .run_command(cmd)
-                .await
-                .expect("Failed to run command {cmd}");
-        }
+        writeln!(kanshi_file, "\t{config}").unwrap();
     }
 
     pub fn verify(
@@ -258,17 +276,24 @@ impl MonitorApply {
         let monitor = self
             .search_monitor(monitors)
             .ok_or(Failed(String::from("Monitor not found")))?;
-        self.build_mode_cmd(monitor)
-            .ok_or(ZError::InvalidArgs(String::from("Invalid position")))?;
+
+        // Check if position is valid
+        if self.get_modestr(monitor) == None {
+            return Err(ZError::InvalidArgs(String::from("Invalid position")));
+        }
+
+        // Check if mode is valid
         let mode = monitor
             .search_modes(&self.monitors[0].1)
             .ok_or(ZError::InvalidArgs(String::from(
                 "Invalid resolution / refresh rate",
             )))?;
+
         if !mode.is_valid_scale(self.scale) {
             return Err(ZError::InvalidArgs(String::from("Invalid scale")));
         }
-        if self.build_transfor_cmd(monitor) == None {
+
+        if MonitorTransform::from_u32(self.transform) == None {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
         }
         Ok(())

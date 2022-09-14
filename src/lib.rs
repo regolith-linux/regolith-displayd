@@ -6,10 +6,12 @@ use lazy_static::lazy_static;
 use log::{debug, error, info};
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::process::Command;
+use std::io::Write;
 use std::{
     error::Error,
     fs::{self, File},
-    io::Read,
     path::PathBuf,
     sync::Arc,
     thread,
@@ -25,7 +27,7 @@ lazy_static! {
 }
 
 /// Stores configrations, interacts with sway IPC and monitors hardware changes
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 pub struct DisplayManager {
     serial: u32,
     monitors: Vec<Monitor>,
@@ -40,7 +42,7 @@ pub struct DisplayServer {
     sway_connection: Arc<Mutex<Connection>>,
 }
 
-#[derive(Debug, Clone, SerializeDict, DeserializeDict, Type)]
+#[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
 #[zvariant(signature = "dict")]
 pub struct DisplayManagerProperties {
     #[zvariant(rename = "layout-mode")]
@@ -77,27 +79,87 @@ impl DisplayServer {
         let mut manager_obj = self.manager.lock().await;
         debug!("Serial: {} {}", manager_obj.serial, serial);
         if serial != manager_obj.serial {
-            panic!("Wrong serial");
+            error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
+            return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
         }
-        for monitor in &logical_monitors {
+        let get_dpy_name = |mon: &MonitorApply| {
+            let monitor = mon.search_monitor(&manager_obj.monitors).unwrap();
+            monitor.get_dpy_name().replace(" ", "_")
+        };
+
+        let mut monitors_sorted = logical_monitors.clone();
+        monitors_sorted.sort_by_key(get_dpy_name);
+        let profile_name = monitors_sorted
+            .iter()
+            .map(get_dpy_name)
+            .collect::<Vec<String>>()
+            .join("__");
+        info!("Profile FileName: {profile_name}");
+        let env_vars: HashMap<String, String> = std::env::vars().collect();
+        let home_dir = env_vars.get("HOME").expect("$HOME not defined");
+        let kanshi_base_path: PathBuf = env_vars
+            .get("KANSHI_PARTIALS")
+            .unwrap_or(&format!("{home_dir}/.config/regolith2/kanshi/output/"))
+            .into();
+
+        fs::create_dir_all(&kanshi_base_path).unwrap();
+        let mut profile_buf = File::options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(kanshi_base_path.join(&profile_name))
+            .expect("Error while opening profile file for writing");
+
+        writeln!(&mut profile_buf, "profile {{").unwrap();
+
+        let mut active_mons = Vec::new();
+        for logical_monitor in &logical_monitors {
+            // If apply_monitors_config called with method == 0 (Verify configuration)
             if method == 0 {
-                match monitor.verify(&self.sway_connection, &manager_obj.monitors) {
+                match logical_monitor.verify(&self.sway_connection, &manager_obj.monitors) {
                     Ok(_) => continue,
                     Err(e) => return Err(e),
                 };
             }
-            monitor
-                .apply(&self.sway_connection, &manager_obj.monitors)
-                .await;
+            let monitor = logical_monitor
+                .search_monitor(&manager_obj.monitors)
+                .unwrap();
+            active_mons.push(monitor);
+            // logical_monitor.apply(&self.sway_connection, &monitor).await;
+            logical_monitor.save_kanshi(&mut profile_buf, &monitor);
         }
         if method == 0 {
             return Ok(());
         }
-        manager_obj
-            .get_monitor_info(&self.sway_connection)
-            .await
-            .unwrap();
+        for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
+            writeln!(
+                &profile_buf,
+                "\toutput {} disable",
+                disabled_mon.get_dpy_name()
+            )
+            .expect("Failed to write to file");
+        }
+        writeln!(&mut profile_buf, "}}").unwrap();
         manager_obj.properties = properties;
+        if let Err(e) = profile_buf.sync_all() {
+            error!("Error writing data to kanshi config file: {e}");
+        }
+        
+        // reload kanshi config 
+        match get_kanshi_pid() { // Get pid of current kanshi instance
+            Ok(pid) => {
+                info!("kanshi pid: {pid}");
+                let mut kanshi_reload_cmd = Command::new("kill");
+                kanshi_reload_cmd.args(["-s", "SIGHUP", pid.trim()]); // Send SIGHUP to kanshi
+                if let Err(e) = kanshi_reload_cmd.spawn() {
+                    error!("Failed to send signal to kanshi: {e}");
+                }
+            }
+            Err(e) => error!("Failed to reload kanshi config: {e}"),
+        }
+        if let Err(e) = manager_obj.get_monitor_info(&self.sway_connection).await {
+            error!("Error getting output information from sway: {e}");
+        }
         DisplayManager::emit_monitors_changed().await?;
         Ok(())
     }
@@ -150,70 +212,50 @@ impl DisplayManager {
             properties: DisplayManagerProperties::new(),
         }
     }
-    /// Watch for monitor changes.
+
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
-    ) -> Result<(), Box<dyn Error>> {
-        let prefix = "card";
-        let get_monitor_state = |path: &PathBuf| {
-            let mut status = String::from("Off");
-            let status_path = path.join("dpms");
-            if status_path.exists() {
-                File::open(status_path)
-                    .unwrap()
-                    .read_to_string(&mut status)
-                    .unwrap();
-            }
-            let enabled_path = path.join("enabled");
-            let mut enabled = String::from("disabled");
-            if enabled_path.exists() {
-                File::open(enabled_path)
-                    .unwrap()
-                    .read_to_string(&mut enabled)
-                    .unwrap();
-            }
-            (status, enabled)
-        };
-        let get_outputs = || -> Vec<_> {
-            let outputs = fs::read_dir("/sys/class/drm/")
-                .unwrap()
-                .map(|r| r.unwrap())
-                .filter(|item| item.file_name().to_str().unwrap().starts_with(prefix))
-                .map(|item| item.path())
-                .map(|path| {
-                    let status = get_monitor_state(&path);
-                    (path, status)
-                })
-                .collect();
-            outputs
-        };
-        info!("Watching Monitor Changes...");
-        let mut outputs;
+    )-> Result<(), Box<dyn Error>> {
+        let mut prev_monitor_set = HashSet::new();
+        let mut prev_logical_monitor_set = HashSet::new();
         loop {
-            let manager_obj_ref = Arc::clone(&manager_obj);
-            outputs = get_outputs();
-            thread::sleep(Duration::from_millis(600));
-            for output in &*outputs {
-                let curr_status = get_monitor_state(&output.0);
-                if curr_status != output.1 {
-                    debug!("Change Detected");
-                    info!("Displays changed...");
-                    info!("Display Status: {:?}", outputs);
-                    if let Err(e) = manager_obj_ref
-                        .lock()
-                        .await
-                        .get_monitor_info(&sway_connection)
-                        .await
-                    {
-                        error!("{e}");
-                    };
-                    Self::emit_monitors_changed().await?;
-                    info!("Emiting MonitorsChanged signal...");
-                    break;
+            thread::sleep(Duration::from_millis(700));
+            let mut manager_obj_lock = manager_obj.lock().await;
+            let display_info = manager_obj_lock.get_monitor_info(&sway_connection).await.unwrap();
+            let mut monitor_set = HashSet::new();
+            let mut logical_monitor_set = HashSet::new();
+            let mut monitors_changed = false;
+            for monitor in &display_info.0 {
+                if !prev_monitor_set.contains(monitor) {
+                    monitors_changed = true;
                 }
+                monitor_set.insert(monitor.clone());
+            }
+            for logical_monitor in &display_info.1 {
+                if !prev_logical_monitor_set.contains(logical_monitor) {
+                    monitors_changed = true;
+                }
+                logical_monitor_set.insert(logical_monitor.clone());
+            }
+            if monitors_changed {
+                prev_monitor_set = monitor_set;
+                prev_logical_monitor_set = logical_monitor_set;
+                manager_obj_lock.monitors = display_info.0.clone();
+                manager_obj_lock.logical_monitors = display_info.1.clone();
+                debug!("monitors info: {:#?}", manager_obj_lock.monitors);
+                debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
+                Self::emit_monitors_changed().await?;
             }
         }
+    }
+
+    /// Get list of all the monitors that are not active
+    fn get_disabled_monitors(&self, active_mons: &Vec<&Monitor>) -> Vec<&Monitor> {
+        self.monitors
+            .iter()
+            .filter(|mon| !active_mons.contains(mon))
+            .collect()
     }
 
     pub async fn emit_monitors_changed() -> zbus::Result<()> {
@@ -232,24 +274,19 @@ impl DisplayManager {
         Ok(())
     }
 
+    /// Returns list of all monitors and logical monitors
     pub async fn get_monitor_info<'a>(
         &mut self,
         sway_connection: &Mutex<Connection>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
-        self.monitors = outputs
+        let monitors = outputs
             .iter()
             .filter(|o| o.active)
             .map(|o| Monitor::new(o))
             .collect();
-        self.logical_monitors = outputs
-            .iter()
-            .filter(|o| o.active)
-            .map(|o| LogicalMonitor::new(o))
-            .collect();
-        info!("monitors info: {:#?}", self.monitors);
-        info!("logical monitors: {:#?}", self.logical_monitors);
-        Ok(())
+        let logical_monitors = outputs.iter().map(|o| LogicalMonitor::new(o)).collect();
+        Ok((monitors, logical_monitors))
     }
 }
 
@@ -282,4 +319,13 @@ impl Error for ServerError {
     fn description(&self) -> &str {
         &self.description
     }
+}
+
+/// Get the pid of the currently running kanshi instance
+pub fn get_kanshi_pid() -> Result<String, Box<dyn Error>> {
+    let pid_bytes = Command::new("pidof")
+        .arg("kanshi")
+        .output()?
+        .stdout;
+    Ok(String::from_utf8(pid_bytes)?)
 }

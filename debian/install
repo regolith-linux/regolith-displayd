@@ -1,2 +1,3 @@
-regolith-displayd.service /usr/lib/systemd/user/
+regolith-displayd.desktop /usr/share/applications/
 target/release/regolith-displayd /usr/bin/
+regolith-displayd-init /usr/bin/

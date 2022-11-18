@@ -98,16 +98,18 @@ impl DisplayServer {
         let env_vars: HashMap<String, String> = std::env::vars().collect();
         let home_dir = env_vars.get("HOME").expect("$HOME not defined");
         let kanshi_base_path: PathBuf = env_vars
-            .get("KANSHI_PARTIALS")
-            .unwrap_or(&format!("{home_dir}/.config/regolith2/kanshi/output/"))
+            .get("REGOLITH_KANSHI_DIR")
+            .unwrap_or(&format!("{home_dir}/.config/regolith2/kanshi/"))
             .into();
 
-        fs::create_dir_all(&kanshi_base_path).unwrap();
+        let kanshi_out_path: PathBuf = kanshi_base_path.join("profiles");
+
+        fs::create_dir_all(&kanshi_out_path).unwrap();
         let mut profile_buf = File::options()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(kanshi_base_path.join(&profile_name))
+            .open(kanshi_out_path.join(&profile_name))
             .expect("Error while opening profile file for writing");
 
         writeln!(&mut profile_buf, "profile {{").unwrap();

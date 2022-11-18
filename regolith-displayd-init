@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -o pipefail
+set -e
+
+DEFAULT_KANSHI_DIR="$HOME/.config/regolith2/kanshi"
+KANSHI_DIR=${REGOLITH_KANSHI_DIR:-"$DEFAULT_KANSHI_DIR"}
+PROFILES_DIR="$KANSHI_DIR/profiles"
+
+mkdir -p "$KANSHI_DIR"
+
+if [ ! -f $KANSHI_DIR/config ]; then
+	echo "include $PROFILES_DIR/*" > "$KANSHI_DIR/config"
+fi
+
+PROFILES_COUNT=$(ls $PROFILES_DIR | wc -l)
+
+if [ "$PROFILES_COUNT" == "0" ]; then
+	echo "profile {}" > "$PROFILES_DIR/dummy"
+else
+	echo "FOUND $PROFILES_COUNT profiles" 
+fi
+
+killall kanshi || true
+
+kanshi -c "$KANSHI_DIR/config"

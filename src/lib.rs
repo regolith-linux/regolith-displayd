@@ -152,7 +152,7 @@ impl DisplayServer {
             Ok(pid) => {
                 info!("kanshi pid: {pid}");
                 let mut kanshi_reload_cmd = Command::new("kill");
-                kanshi_reload_cmd.args(["-s", "SIGHUP", pid.trim()]); // Send SIGHUP to kanshi
+                kanshi_reload_cmd.args(["-s", "SIGHUP", &pid]); // Send SIGHUP to kanshi
                 if let Err(e) = kanshi_reload_cmd.spawn() {
                     error!("Failed to send signal to kanshi: {e}");
                 }
@@ -329,5 +329,7 @@ pub fn get_kanshi_pid() -> Result<String, Box<dyn Error>> {
         .arg("kanshi")
         .output()?
         .stdout;
-    Ok(String::from_utf8(pid_bytes)?)
+    let pids_str = String::from_utf8(pid_bytes)?;
+    let pid = pids_str.trim().split(" ").next().ok_or(String::from("No running instances of kanshi found"))?;
+    Ok(String::from(pid))
 }

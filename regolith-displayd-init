@@ -25,6 +25,5 @@ else
 fi
 
 # Start regolith-displayd if not already running
-pidof regolith-displayd > /dev/null \
-	&& echo "regolith-displayd is already running" \
-	|| regolith-displayd
+killall /usr/bin/regolith-displayd -u $USER|| true
+/usr/bin/regolith-displayd

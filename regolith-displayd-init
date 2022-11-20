@@ -7,20 +7,24 @@ DEFAULT_KANSHI_DIR="$HOME/.config/regolith2/kanshi"
 KANSHI_DIR=${REGOLITH_KANSHI_DIR:-"$DEFAULT_KANSHI_DIR"}
 PROFILES_DIR="$KANSHI_DIR/profiles"
 
-mkdir -p "$KANSHI_DIR"
+mkdir -p "$PROFILES_DIR"
 
+# create config file if doesn't already exist
 if [ ! -f $KANSHI_DIR/config ]; then
 	echo "include $PROFILES_DIR/*" > "$KANSHI_DIR/config"
 fi
 
 PROFILES_COUNT=$(ls $PROFILES_DIR | wc -l)
 
+# Create dummy profile file if profiles_dir is empty 
+# to avoid kanshi's file not found error
 if [ "$PROFILES_COUNT" == "0" ]; then
 	echo "profile {}" > "$PROFILES_DIR/dummy"
 else
 	echo "FOUND $PROFILES_COUNT profiles" 
 fi
 
-killall kanshi || true
-
-kanshi -c "$KANSHI_DIR/config"
+# Start regolith-displayd if not already running
+pidof regolith-displayd > /dev/null \
+	&& echo "regolith-displayd is already running" \
+	|| regolith-displayd

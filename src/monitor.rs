@@ -257,7 +257,7 @@ impl MonitorApply {
         let transform =
             MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
         let config = format!(
-            "output '{}' mode {} position {},{} transform {} scale {}",
+            "output \"{}\" mode {} position {},{} transform {} scale {}",
             dpy_name,
             mode,
             self.x_pos,

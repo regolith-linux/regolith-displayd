@@ -3,12 +3,12 @@ pub mod monitor;
 
 use core::fmt;
 use lazy_static::lazy_static;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 use std::io::Write;
+use std::process::Command;
 use std::{
     error::Error,
     fs::{self, File},
@@ -60,6 +60,11 @@ pub struct ServerError {
     description: String,
 }
 
+pub struct KanshiPaths {
+    profiles: PathBuf,
+    config: PathBuf,
+}
+
 #[dbus_interface(name = "org.gnome.Mutter.DisplayConfig")]
 impl DisplayServer {
     pub async fn get_current_state(&mut self) -> DisplayManager {
@@ -95,21 +100,15 @@ impl DisplayServer {
             .collect::<Vec<String>>()
             .join("__");
         info!("Profile FileName: {profile_name}");
-        let env_vars: HashMap<String, String> = std::env::vars().collect();
-        let home_dir = env_vars.get("HOME").expect("$HOME not defined");
-        let kanshi_base_path: PathBuf = env_vars
-            .get("REGOLITH_KANSHI_DIR")
-            .unwrap_or(&format!("{home_dir}/.config/regolith2/kanshi/"))
-            .into();
 
-        let kanshi_out_path: PathBuf = kanshi_base_path.join("profiles");
+        let kanshi_paths = get_kanshi_paths().await?;
 
-        fs::create_dir_all(&kanshi_out_path).unwrap();
+        fs::create_dir_all(&kanshi_paths.profiles).unwrap();
         let mut profile_buf = File::options()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(kanshi_out_path.join(&profile_name))
+            .open(kanshi_paths.profiles.join(&profile_name))
             .expect("Error while opening profile file for writing");
 
         writeln!(&mut profile_buf, "profile {{").unwrap();
@@ -127,7 +126,6 @@ impl DisplayServer {
                 .search_monitor(&manager_obj.monitors)
                 .unwrap();
             active_mons.push(monitor);
-            // logical_monitor.apply(&self.sway_connection, &monitor).await;
             logical_monitor.save_kanshi(&mut profile_buf, &monitor);
         }
         if method == 0 {
@@ -146,18 +144,10 @@ impl DisplayServer {
         if let Err(e) = profile_buf.sync_all() {
             error!("Error writing data to kanshi config file: {e}");
         }
-        
-        // reload kanshi config 
-        match get_kanshi_pid() { // Get pid of current kanshi instance
-            Ok(pid) => {
-                info!("kanshi pid: {pid}");
-                let mut kanshi_reload_cmd = Command::new("kill");
-                kanshi_reload_cmd.args(["-s", "SIGHUP", &pid]); // Send SIGHUP to kanshi
-                if let Err(e) = kanshi_reload_cmd.spawn() {
-                    error!("Failed to send signal to kanshi: {e}");
-                }
-            }
-            Err(e) => error!("Failed to reload kanshi config: {e}"),
+
+        // reload kanshi config
+        if let Err(e) = reload_kanshi().await {
+            error!("Error reloading kanshi configuration: {e}");
         }
         if let Err(e) = manager_obj.get_monitor_info(&self.sway_connection).await {
             error!("Error getting output information from sway: {e}");
@@ -218,13 +208,16 @@ impl DisplayManager {
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
-    )-> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error>> {
         let mut prev_monitor_set = HashSet::new();
         let mut prev_logical_monitor_set = HashSet::new();
         loop {
             thread::sleep(Duration::from_millis(700));
             let mut manager_obj_lock = manager_obj.lock().await;
-            let display_info = manager_obj_lock.get_monitor_info(&sway_connection).await.unwrap();
+            let display_info = manager_obj_lock
+                .get_monitor_info(&sway_connection)
+                .await
+                .unwrap();
             let mut monitor_set = HashSet::new();
             let mut logical_monitor_set = HashSet::new();
             let mut monitors_changed = false;
@@ -323,13 +316,38 @@ impl Error for ServerError {
     }
 }
 
-/// Get the pid of the currently running kanshi instance
-pub fn get_kanshi_pid() -> Result<String, Box<dyn Error>> {
-    let pid_bytes = Command::new("pidof")
-        .arg("kanshi")
-        .output()?
-        .stdout;
-    let pids_str = String::from_utf8(pid_bytes)?;
-    let pid = pids_str.trim().split(" ").next().ok_or(String::from("No running instances of kanshi found"))?;
-    Ok(String::from(pid))
+pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
+    let env_vars: HashMap<String, String> = std::env::vars().collect();
+    let home_dir = env_vars.get("HOME").expect("$HOME not defined");
+    let default_path = format!("{home_dir}/.config/regolith2/kanshi");
+    let base: PathBuf = match trawlcat::rescat("kanshi.path", Some(default_path.clone())).await {
+        Ok(path) => {
+            match path.try_into() {
+                Ok(path_buf) => path_buf,
+                Err(e) => {
+                    warn!("Error: {e}");
+                    default_path.into()
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Error: {e}");
+            default_path.into()
+        }
+    };
+    let profiles = base.join("profiles");
+    let config = base.join("config");
+    return Ok(KanshiPaths { profiles, config });
+}
+
+pub async fn reload_kanshi() -> zbus::Result<()> {
+    let KanshiPaths { config, .. } = get_kanshi_paths().await?;
+    let default_config_path = String::from("~/.config/regolith2/kanshi/config");
+    let config_path:String = config
+        .into_os_string()
+        .into_string()
+        .unwrap_or(default_config_path);
+    Command::new("killall").arg("kanshi").spawn()?;
+    Command::new("kanshi").arg("-c").arg(&config_path).spawn()?;
+    Ok(())
 }

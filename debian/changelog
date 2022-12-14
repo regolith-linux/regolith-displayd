@@ -1,3 +1,25 @@
+regolith-displayd (0.2) focal; urgency=medium
+
+  [ Regolith Linux ]
+  * Add copyright owner
+
+  [ Soumya Ranjan Patnaik ]
+  * Fix gnome-control-center crash with inactive displays
+  * Emit monitors_changed signal on display enable/disable
+  * Disabled monitors are now filtered out, changed polling rate
+  * Persist settings using kanshi (#1)
+  * Added kanshi autostart script
+  * fix: unable to kill multiple processes
+  * restart kanshi on settings change
+  * init script to start kanshi and regoltih-displayd
+  * Makefile cleanup, set CARGO_HOME to avoid permission issues
+  * Remove desktop file
+  * Fix output not recognised error (change quotes to ' " ')
+  * Fix regolith-displayd-init killall terminating the script
+  * Cleanup Makefile
+
+ -- soumyarp <soumyaranjan1812@gmail.com>  Thu, 15 Dec 2022 01:23:55 +0530
+
 regolith-displayd (0.1-2) focal; urgency=medium
 
   * Update packaging

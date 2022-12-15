@@ -111,26 +111,26 @@ impl DisplayServer {
             .open(kanshi_paths.profiles.join(&profile_name))
             .expect("Error while opening profile file for writing");
 
-        writeln!(&mut profile_buf, "profile {{").unwrap();
-
-        let mut active_mons = Vec::new();
-        for logical_monitor in &logical_monitors {
-            // If apply_monitors_config called with method == 0 (Verify configuration)
-            if method == 0 {
-                match logical_monitor.verify(&self.sway_connection, &manager_obj.monitors) {
-                    Ok(_) => continue,
-                    Err(e) => return Err(e),
+            
+            let mut active_mons = Vec::new();
+            for logical_monitor in &logical_monitors {
+                // If apply_monitors_config called with method == 0 (Verify configuration)
+                if method == 0 {
+                    match logical_monitor.verify(&self.sway_connection, &manager_obj.monitors) {
+                        Ok(_) => continue,
+                        Err(e) => return Err(e),
                 };
             }
             let monitor = logical_monitor
-                .search_monitor(&manager_obj.monitors)
-                .unwrap();
+            .search_monitor(&manager_obj.monitors)
+            .unwrap();
             active_mons.push(monitor);
             logical_monitor.save_kanshi(&mut profile_buf, &monitor);
         }
         if method == 0 {
             return Ok(());
         }
+        writeln!(&mut profile_buf, "profile {{").unwrap();
         for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
             writeln!(
                 &profile_buf,

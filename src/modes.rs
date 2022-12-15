@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use swayipc_async::{Mode as SwayMode, Output};
-use zvariant::{DeserializeDict, SerializeDict, Type};
+use serde::{ Deserialize, Serialize };
+use swayipc_async::{ Mode as SwayMode, Output };
+use zvariant::{ DeserializeDict, SerializeDict, Type };
 
 #[derive(Debug, Clone, Deserialize, Serialize, Type, PartialEq)]
 pub struct Modes {
@@ -30,12 +30,7 @@ impl Modes {
     }
 
     pub fn new(output: &Output, mode_info: &SwayMode) -> Modes {
-        let SwayMode {
-            height,
-            width,
-            refresh,
-            ..
-        } = *mode_info;
+        let SwayMode { height, width, refresh, .. } = *mode_info;
         let is_current = match &output.current_mode {
             Some(x) => Self::is_current_mode(x, mode_info),
             _ => false,
@@ -55,10 +50,10 @@ impl Modes {
                 "{}x{}@{}Hz",
                 mode_info.width,
                 mode_info.height,
-                mode_info.refresh as f64 / 1000f64
+                (mode_info.refresh as f64) / 1000f64
             ),
             preferred_scale: 1f64,
-            refresh_rate: refresh as f64 / 1000f64,
+            refresh_rate: (refresh as f64) / 1000f64,
             properties,
         }
     }
@@ -69,9 +64,9 @@ impl Modes {
         self.supported_scales.contains(&scale)
     }
     pub fn is_current_mode(actual: &SwayMode, current: &SwayMode) -> bool {
-        current.height == actual.height
-            && current.width == actual.width
-            && current.refresh == actual.refresh
+        current.height == actual.height &&
+            current.width == actual.width &&
+            current.refresh == actual.refresh
     }
     pub fn current(&self) -> bool {
         self.properties.current == Some(true)

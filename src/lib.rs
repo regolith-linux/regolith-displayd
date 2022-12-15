@@ -3,24 +3,17 @@ pub mod monitor;
 
 use core::fmt;
 use lazy_static::lazy_static;
-use log::{debug, error, info, warn};
-use monitor::{LogicalMonitor, Monitor, MonitorApply};
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use log::{ debug, error, info, warn };
+use monitor::{ LogicalMonitor, Monitor, MonitorApply };
+use serde::{ Deserialize, Serialize };
+use std::collections::{ HashMap, HashSet };
 use std::io::Write;
 use std::process::Command;
-use std::{
-    error::Error,
-    fs::{self, File},
-    path::PathBuf,
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{ error::Error, fs::{ self, File }, path::PathBuf, sync::Arc, thread, time::Duration };
 use swayipc_async::Connection;
 use tokio::sync::Mutex;
-use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
-use zvariant::{DeserializeDict, SerializeDict, Type};
+use zbus::{ dbus_interface, ConnectionBuilder, SignalContext };
+use zvariant::{ DeserializeDict, SerializeDict, Type };
 
 lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
@@ -78,7 +71,7 @@ impl DisplayServer {
         serial: u32,
         method: u32,
         logical_monitors: Vec<MonitorApply>,
-        properties: DisplayManagerProperties,
+        properties: DisplayManagerProperties
     ) -> zbus::fdo::Result<()> {
         debug!("Configuration Method: {method}");
         let mut manager_obj = self.manager.lock().await;
@@ -111,19 +104,20 @@ impl DisplayServer {
             .open(kanshi_paths.profiles.join(&profile_name))
             .expect("Error while opening profile file for writing");
 
-            
-            let mut active_mons = Vec::new();
-            for logical_monitor in &logical_monitors {
-                // If apply_monitors_config called with method == 0 (Verify configuration)
-                if method == 0 {
-                    match logical_monitor.verify(&self.sway_connection, &manager_obj.monitors) {
-                        Ok(_) => continue,
-                        Err(e) => return Err(e),
-                };
+        let mut active_mons = Vec::new();
+        for logical_monitor in &logical_monitors {
+            // If apply_monitors_config called with method == 0 (Verify configuration)
+            if method == 0 {
+                match logical_monitor.verify(&self.sway_connection, &manager_obj.monitors) {
+                    Ok(_) => {
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
             }
-            let monitor = logical_monitor
-            .search_monitor(&manager_obj.monitors)
-            .unwrap();
+            let monitor = logical_monitor.search_monitor(&manager_obj.monitors).unwrap();
             active_mons.push(monitor);
             logical_monitor.save_kanshi(&mut profile_buf, &monitor);
         }
@@ -132,12 +126,9 @@ impl DisplayServer {
         }
         writeln!(&mut profile_buf, "profile {{").unwrap();
         for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
-            writeln!(
-                &profile_buf,
-                "\toutput {} disable",
-                disabled_mon.get_dpy_name()
-            )
-            .expect("Failed to write to file");
+            writeln!(&profile_buf, "\toutput {} disable", disabled_mon.get_dpy_name()).expect(
+                "Failed to write to file"
+            );
         }
         writeln!(&mut profile_buf, "}}").unwrap();
         manager_obj.properties = properties;
@@ -169,7 +160,7 @@ impl DisplayServer {
 impl DisplayServer {
     pub async fn new(
         manager: Arc<Mutex<DisplayManager>>,
-        sway_connection: Arc<Mutex<Connection>>,
+        sway_connection: Arc<Mutex<Connection>>
     ) -> DisplayServer {
         DisplayServer {
             manager,
@@ -178,19 +169,14 @@ impl DisplayServer {
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
-        self.manager
-            .lock()
-            .await
-            .get_monitor_info(&self.sway_connection)
-            .await?;
+        self.manager.lock().await.get_monitor_info(&self.sway_connection).await?;
 
         let mut connection = ZBUS_CONNECTION.lock().await;
         *connection = Some(
             ConnectionBuilder::session()?
                 .name("org.gnome.Mutter.DisplayConfig")?
                 .serve_at("/org/gnome/Mutter/DisplayConfig", self)?
-                .build()
-                .await?,
+                .build().await?
         );
         Ok(())
     }
@@ -207,17 +193,14 @@ impl DisplayManager {
 
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
-        sway_connection: Arc<Mutex<Connection>>,
+        sway_connection: Arc<Mutex<Connection>>
     ) -> Result<(), Box<dyn Error>> {
         let mut prev_monitor_set = HashSet::new();
         let mut prev_logical_monitor_set = HashSet::new();
         loop {
             thread::sleep(Duration::from_millis(700));
             let mut manager_obj_lock = manager_obj.lock().await;
-            let display_info = manager_obj_lock
-                .get_monitor_info(&sway_connection)
-                .await
-                .unwrap();
+            let display_info = manager_obj_lock.get_monitor_info(&sway_connection).await.unwrap();
             let mut monitor_set = HashSet::new();
             let mut logical_monitor_set = HashSet::new();
             let mut monitors_changed = false;
@@ -262,9 +245,8 @@ impl DisplayManager {
                 "/org/gnome/Mutter/DisplayConfig",
                 "org.gnome.Mutter.DisplayConfig",
                 "MonitorsChanged",
-                &(),
-            )
-            .await?;
+                &()
+            ).await?;
         }
         Ok(())
     }
@@ -272,7 +254,7 @@ impl DisplayManager {
     /// Returns list of all monitors and logical monitors
     pub async fn get_monitor_info<'a>(
         &mut self,
-        sway_connection: &Mutex<Connection>,
+        sway_connection: &Mutex<Connection>
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
         let monitors = outputs
@@ -280,7 +262,10 @@ impl DisplayManager {
             .filter(|o| o.active)
             .map(|o| Monitor::new(o))
             .collect();
-        let logical_monitors = outputs.iter().map(|o| LogicalMonitor::new(o)).collect();
+        let logical_monitors = outputs
+            .iter()
+            .map(|o| LogicalMonitor::new(o))
+            .collect();
         Ok((monitors, logical_monitors))
     }
 }
@@ -343,10 +328,7 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
 pub async fn reload_kanshi() -> zbus::Result<()> {
     let KanshiPaths { config, .. } = get_kanshi_paths().await?;
     let default_config_path = String::from("~/.config/regolith2/kanshi/config");
-    let config_path:String = config
-        .into_os_string()
-        .into_string()
-        .unwrap_or(default_config_path);
+    let config_path: String = config.into_os_string().into_string().unwrap_or(default_config_path);
     Command::new("killall").arg("kanshi").spawn()?;
     Command::new("kanshi").arg("-c").arg(&config_path).spawn()?;
     Ok(())

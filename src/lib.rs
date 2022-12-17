@@ -97,14 +97,19 @@ impl DisplayServer {
         let kanshi_paths = get_kanshi_paths().await?;
 
         fs::create_dir_all(&kanshi_paths.profiles).unwrap();
-        let mut profile_buf = File::options()
+        let mut profile_file = File::options()
             .create(true)
             .write(true)
             .truncate(true)
             .open(kanshi_paths.profiles.join(&profile_name))
             .expect("Error while opening profile file for writing");
 
+        // Profile Write buffer (Only written if no errors occur)
+        let mut profile_buf = Vec::new();
+
         let mut active_mons = Vec::new();
+
+        writeln!(&mut profile_buf, "profile {{").unwrap();
         for logical_monitor in &logical_monitors {
             // If apply_monitors_config called with method == 0 (Verify configuration)
             if method == 0 {
@@ -124,16 +129,17 @@ impl DisplayServer {
         if method == 0 {
             return Ok(());
         }
-        writeln!(&mut profile_buf, "profile {{").unwrap();
         for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
-            writeln!(&profile_buf, "\toutput {} disable", disabled_mon.get_dpy_name()).expect(
+            writeln!(&mut profile_buf, "\toutput {} disable", disabled_mon.get_dpy_name()).expect(
                 "Failed to write to file"
             );
         }
         writeln!(&mut profile_buf, "}}").unwrap();
         manager_obj.properties = properties;
-        if let Err(e) = profile_buf.sync_all() {
+        
+        if let Err(e) = profile_file.write(&profile_buf) {
             error!("Error writing data to kanshi config file: {e}");
+            return Err(zbus::fdo::Error::IOError(e.to_string()));
         }
 
         // reload kanshi config

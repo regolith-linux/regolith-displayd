@@ -3,10 +3,9 @@ use log::{warn, error};
 use num;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 use std::hash::Hash;
 use std::io::Write;
-use std::{sync::Arc};
+use std::sync::Arc;
 use swayipc_async::{Connection, Output};
 use tokio::sync::Mutex;
 use zbus::fdo::Error::{self as ZError, Failed};
@@ -248,7 +247,7 @@ impl MonitorApply {
             .find(|mon| mon.description.0 == self.monitors[0].0)
     }
 
-    pub fn save_kanshi(&self, kanshi_file: &mut File, monitor: &Monitor) {
+    pub fn save_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) {
         let dpy_name = monitor.get_dpy_name();
         let mode = match self.get_modestr(&monitor) {
             Some(x) => x,

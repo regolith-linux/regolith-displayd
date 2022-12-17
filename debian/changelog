@@ -1,3 +1,10 @@
+regolith-displayd (0.2.2ubuntu1) focal; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * fix profile data writes
+
+ -- Soumya Ranjan patnaik <soumyaranjan1812@gmail.com>  Sat, 17 Dec 2022 18:29:44 +0530
+
 regolith-displayd (0.2.2) focal; urgency=medium
 
   * Fix incorrect profile
@@ -25,7 +32,7 @@ regolith-displayd (0.2) focal; urgency=medium
   * Fix regolith-displayd-init killall terminating the script
   * Cleanup Makefile
 
- -- soumyarp <soumyaranjan1812@gmail.com>  Thu, 15 Dec 2022 01:23:55 +0530
+ -- Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>  Thu, 15 Dec 2022 01:23:55 +0530
 
 regolith-displayd (0.1-2) focal; urgency=medium
 
@@ -37,4 +44,4 @@ regolith-displayd (0.1) focal; urgency=low
 
   * Initial release. 
 
- -- Soumya Ranjan Patnai <soumyaranjan1812@gmail.com>  Mon, 25 Jul 2022 03:45:27 +0530
+ -- Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>  Mon, 25 Jul 2022 03:45:27 +0530

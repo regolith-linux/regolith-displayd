@@ -130,7 +130,7 @@ impl DisplayServer {
             return Ok(());
         }
         for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
-            writeln!(&mut profile_buf, "\toutput {} disable", disabled_mon.get_dpy_name()).expect(
+            writeln!(&mut profile_buf, "\toutput \"{}\" disable", disabled_mon.get_dpy_name()).expect(
                 "Failed to write to file"
             );
         }

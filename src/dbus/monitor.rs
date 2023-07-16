@@ -1,12 +1,11 @@
-use crate::modes::Modes;
-use log::{warn, error};
-use num;
+use crate::dbus::modes::Modes;
+use log::warn;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 use std::io::Write;
+use std::num;
 use std::sync::Arc;
-use swayipc_async::{Connection, Output};
 use tokio::sync::Mutex;
 use zbus::fdo::Error::{self as ZError, Failed};
 use zvariant::{DeserializeDict, SerializeDict, Type};
@@ -78,7 +77,7 @@ pub struct MonitorApply {
 }
 
 impl Monitor {
-    pub fn new(output: &Output) -> Monitor {
+    pub fn new_from_output(output: &Output) -> Monitor {
         let output_modes = output.modes.iter().map(|m| Modes::new(output, m)).collect();
         let description = (
             output.name.clone(),   // connector
@@ -115,13 +114,16 @@ impl Monitor {
 
 impl PartialEq for Monitor {
     fn eq(&self, other: &Self) -> bool {
-        self.description == other.description 
+        self.description == other.description
     }
 }
 
 impl PartialEq for LogicalMonitor {
     fn eq(&self, other: &Self) -> bool {
-        self.x_pos == other.x_pos && self.y_pos == other.y_pos && self.scale == other.scale && self.transform == other.transform
+        self.x_pos == other.x_pos
+            && self.y_pos == other.y_pos
+            && self.scale == other.scale
+            && self.transform == other.transform
     }
 }
 
@@ -141,12 +143,11 @@ impl Hash for LogicalMonitor {
         self.y_pos.hash(state);
         self.x_pos.hash(state);
         self.transform.hash(state);
-        let scale_int = (self.scale * 1000f64 ) as u32;
+        let scale_int = (self.scale * 1000f64) as u32;
         scale_int.hash(state);
         self.monitors[0].hash(state);
     }
 }
-
 
 impl MonitorProperties {
     pub fn new(output: &Output) -> MonitorProperties {
@@ -201,7 +202,7 @@ impl MonitorTransform {
 }
 
 impl LogicalMonitor {
-    pub fn new(output: &Output) -> LogicalMonitor {
+    pub fn new_from_output(output: &Output) -> LogicalMonitor {
         let monitor = [(
             output.name.clone(),   // connector
             output.make.clone(),   // vendor

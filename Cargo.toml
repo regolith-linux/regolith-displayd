@@ -4,16 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 [dependencies]
-log = "0.4"
-pretty_env_logger = "0.4.0"
-tokio = { version = "1", features = ["full"]}
-zbus = { version = "2", default-features = false, features = ["tokio"] }
-serde = "1.0.139"
-zvariant = "3.4.1"
-swayipc-async = "2.0.0"
-lazy_static = "1.4.0"
-num = "0.4.0"
-num-derive = "0.3.3"
+log = "0.4.19"
+num = "0.4.1"
+num-derive = "0.4.0"
 num-traits = "0.2.15"
+pretty_env_logger = "0.5.0"
+serde = "1.0.171"
+tokio = "1.29.1"
 trawlcat = "0.2.3"
+wayland-client = "0.30.2"
+wayland-protocols-wlr = "0.1.0"
+zbus = "3.14.1"
+zvariant = "3.15.0"

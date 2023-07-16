@@ -310,7 +310,7 @@ impl Error for ServerError {
 pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
     let env_vars: HashMap<String, String> = std::env::vars().collect();
     let home_dir = env_vars.get("HOME").expect("$HOME not defined");
-    let default_path = format!("{home_dir}/.config/regolith2/kanshi");
+    let default_path = format!("{home_dir}/.config/regolith3/kanshi");
     let base: PathBuf = match trawlcat::rescat("kanshi.path", Some(default_path.clone())).await {
         Ok(path) => {
             match path.try_into() {
@@ -333,7 +333,7 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
 
 pub async fn reload_kanshi() -> zbus::Result<()> {
     let KanshiPaths { config, .. } = get_kanshi_paths().await?;
-    let default_config_path = String::from("~/.config/regolith2/kanshi/config");
+    let default_config_path = String::from("~/.config/regolith3/kanshi/config");
     let config_path: String = config.into_os_string().into_string().unwrap_or(default_config_path);
     Command::new("killall").arg("kanshi").spawn()?;
     Command::new("kanshi").arg("-c").arg(&config_path).spawn()?;

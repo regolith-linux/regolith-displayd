@@ -3,7 +3,7 @@
 set -o pipefail
 set -e
 
-DEFAULT_KANSHI_DIR="$HOME/.config/regolith2/kanshi"
+DEFAULT_KANSHI_DIR="$HOME/.config/regolith3/kanshi"
 KANSHI_DIR=${REGOLITH_KANSHI_DIR:-"$DEFAULT_KANSHI_DIR"}
 PROFILES_DIR="$KANSHI_DIR/profiles"
 

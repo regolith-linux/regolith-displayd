@@ -1,4 +1,4 @@
-regolith-displayd (0.2.3ubuntu1) UNRELEASED; urgency=medium
+regolith-displayd (0.2.3ubuntu1) focal; urgency=medium
 
   * It was not possible to disable a monitor due to missing quotes
 

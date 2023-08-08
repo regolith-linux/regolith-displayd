@@ -1,3 +1,10 @@
+regolith-displayd (0.2.4) focal; urgency=medium
+
+  * chore: linting changes
+  * feat: add fractional scaling for resolutions greater than 1920 x 1080
+
+ -- Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>  Wed, 09 Aug 2023 02:14:15 +0530
+
 regolith-displayd (0.2.3ubuntu1) focal; urgency=medium
 
   * It was not possible to disable a monitor due to missing quotes

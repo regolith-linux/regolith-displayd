@@ -46,7 +46,11 @@ impl Modes {
             interlaced: Some(false),
             preferred: Some(false),
         };
-        let supported_scales = [1.0, 2.0].to_vec();
+        let supported_scales = if width >= 1920 && height >= 1080 {
+            [1.0, 1.25, 1.5, 1.75, 2.0].to_vec()
+        } else {
+            [1.0, 2.0].to_vec()
+        };
         Modes {
             width,
             height,

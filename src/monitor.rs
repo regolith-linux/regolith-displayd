@@ -1,5 +1,5 @@
 use crate::modes::Modes;
-use log::{warn, error};
+use log::{error, warn};
 use num;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};
@@ -105,19 +105,23 @@ impl Monitor {
     pub fn get_current_mode(&self) -> &str {
         match self.modes.iter().find(|&mode| mode.current()) {
             Some(m) => m.get_modestr(),
+            None => "Unknown",
         }
     }
 }
 
 impl PartialEq for Monitor {
     fn eq(&self, other: &Self) -> bool {
-        self.description == other.description 
+        self.description == other.description
     }
 }
 
 impl PartialEq for LogicalMonitor {
     fn eq(&self, other: &Self) -> bool {
-        self.x_pos == other.x_pos && self.y_pos == other.y_pos && self.scale == other.scale && self.transform == other.transform
+        self.x_pos == other.x_pos
+            && self.y_pos == other.y_pos
+            && self.scale == other.scale
+            && self.transform == other.transform
     }
 }
 
@@ -137,12 +141,11 @@ impl Hash for LogicalMonitor {
         self.y_pos.hash(state);
         self.x_pos.hash(state);
         self.transform.hash(state);
-        let scale_int = (self.scale * 1000f64 ) as u32;
+        let scale_int = (self.scale * 1000f64) as u32;
         scale_int.hash(state);
         self.monitors[0].hash(state);
     }
 }
-
 
 impl MonitorProperties {
     pub fn new(output: &Output) -> MonitorProperties {

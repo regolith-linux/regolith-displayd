@@ -265,11 +265,11 @@ impl DisplayManager {
         let outputs = sway_connection.lock().await.get_outputs().await?;
         let monitors = outputs
             .iter()
-            .filter(|o| o.active)
             .map(|o| Monitor::new(o))
             .collect();
         let logical_monitors = outputs
             .iter()
+            .filter(|o| o.active)
             .map(|o| LogicalMonitor::new(o))
             .collect();
         Ok((monitors, logical_monitors))

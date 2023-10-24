@@ -105,10 +105,6 @@ impl Monitor {
     pub fn get_current_mode(&self) -> &str {
         match self.modes.iter().find(|&mode| mode.current()) {
             Some(m) => m.get_modestr(),
-            None => {
-                error!("Unable to find the currently active display mode");
-                "Unknown"
-            }
         }
     }
 }

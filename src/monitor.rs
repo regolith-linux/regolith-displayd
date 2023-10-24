@@ -154,11 +154,12 @@ impl MonitorProperties {
             "{} {} {}",
             &output.make, &output.model, &output.serial
         ));
+        let builtin = output.name.starts_with("eDP");
         MonitorProperties {
             width: Some(output.rect.width),
             height: Some(output.rect.height),
             name,
-            builtin: Some(false),
+            builtin: Some(builtin),
             max_size: None,
             underscanning: None,
         }

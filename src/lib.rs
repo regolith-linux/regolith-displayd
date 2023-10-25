@@ -70,7 +70,7 @@ impl DisplayServer {
         &mut self,
         serial: u32,
         method: u32,
-        logical_monitors: Vec<MonitorApply>,
+        mutter_logical_monitors: Vec<MonitorApply>,
         properties: DisplayManagerProperties
     ) -> zbus::fdo::Result<()> {
         debug!("Configuration Method: {method}");
@@ -85,11 +85,13 @@ impl DisplayServer {
             monitor.get_dpy_name().replace(" ", "_")
         };
 
-        let mut monitors_sorted = logical_monitors.clone();
-        monitors_sorted.sort_by_key(get_dpy_name);
+        let mut monitors_sorted = manager_obj.monitors.clone();
+
+        monitors_sorted.sort_by_key(|monitor| monitor.get_dpy_name());
+
         let profile_name = monitors_sorted
             .iter()
-            .map(get_dpy_name)
+            .map(|mon| mon.get_dpy_name().replace(" ", "_"))
             .collect::<Vec<String>>()
             .join("__");
         info!("Profile FileName: {profile_name}");
@@ -110,10 +112,10 @@ impl DisplayServer {
         let mut active_mons = Vec::new();
 
         writeln!(&mut profile_buf, "profile {{").unwrap();
-        for logical_monitor in &logical_monitors {
+        for mutter_logical_mointor in &mutter_logical_monitors {
             // If apply_monitors_config called with method == 0 (Verify configuration)
             if method == 0 {
-                match logical_monitor.verify(&self.sway_connection, &manager_obj.monitors) {
+                match mutter_logical_mointor.verify(&self.sway_connection, &manager_obj.monitors) {
                     Ok(_) => {
                         continue;
                     }
@@ -122,13 +124,18 @@ impl DisplayServer {
                     }
                 }
             }
-            let monitor = logical_monitor.search_monitor(&manager_obj.monitors).unwrap();
-            active_mons.push(monitor);
-            logical_monitor.save_kanshi(&mut profile_buf, &monitor);
+            if let Some(sway_logical_monitor) = mutter_logical_mointor.search_logical_monitor(&manager_obj.logical_monitors) {
+                active_mons.push(sway_logical_monitor);
+            }            
+            let Some(sway_physical_monitor) = mutter_logical_mointor.search_monitor(&manager_obj.monitors) else {
+                continue;
+            };
+            mutter_logical_mointor.save_kanshi(&mut profile_buf, &sway_physical_monitor);
         }
         if method == 0 {
             return Ok(());
         }
+
         for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
             writeln!(&mut profile_buf, "\toutput \"{}\" disable", disabled_mon.get_dpy_name()).expect(
                 "Failed to write to file"
@@ -235,8 +242,8 @@ impl DisplayManager {
     }
 
     /// Get list of all the monitors that are not active
-    fn get_disabled_monitors(&self, active_mons: &Vec<&Monitor>) -> Vec<&Monitor> {
-        self.monitors
+    fn get_disabled_monitors(&self, active_mons: &Vec<&LogicalMonitor>) -> Vec<&LogicalMonitor> {
+        self.logical_monitors
             .iter()
             .filter(|mon| !active_mons.contains(mon))
             .collect()

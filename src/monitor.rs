@@ -230,6 +230,10 @@ impl LogicalMonitor {
             },
         }
     }
+    pub fn get_dpy_name(&self) -> String {
+        let desc = &self.monitors[0];
+        format!("{} {} {}", desc.1, desc.2, desc.3)
+    }
 }
 
 impl MonitorApply {
@@ -247,6 +251,15 @@ impl MonitorApply {
             .find(|mon| mon.description.0 == self.monitors[0].0)
     }
 
+    pub fn search_logical_monitor<'a>(
+        &self,
+        logical_monitors: &'a Vec<LogicalMonitor>,
+    ) -> Option<&'a LogicalMonitor> {
+        logical_monitors
+            .iter()
+            .find(|mon| mon.monitors[0].0 == self.monitors[0].0)
+    }
+
     pub fn save_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) {
         let dpy_name = monitor.get_dpy_name();
         let mode = match self.get_modestr(&monitor) {
@@ -256,7 +269,7 @@ impl MonitorApply {
         let transform =
             MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
         let config = format!(
-            "output \"{}\" mode {} position {},{} transform {} scale {}",
+            "output \"{}\" mode {} position {},{} transform {} scale {} enable",
             dpy_name,
             mode,
             self.x_pos,

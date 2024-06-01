@@ -11,6 +11,3 @@ Restart=on-failure
 StartLimitIntervalSec=10
 StartLimitBurst=5
 
-
-[Install]
-WantedBy=regolith-wayland.target

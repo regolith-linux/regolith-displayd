@@ -1,3 +1,10 @@
+regolith-displayd (0.2.6) jammy; urgency=medium
+
+  [ Soumya Ranjan Patnaik ]
+  * fix: use systemd to synchronize statrup for displayd and kanshi (#5)
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sun, 02 Jun 2024 10:50:19 -0700
+
 regolith-displayd (0.2.5) focal; urgency=medium
 
   [ Soumya Ranjan Patnaik ]

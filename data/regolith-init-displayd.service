@@ -1,0 +1,20 @@
+[Unit]
+Description=Start Regolith Display Daemon
+PartOf=graphical-session.target
+Wants=gnome-session.target
+After=gnome-session.target
+
+Requires=regolith-init-kanshi.service
+Before=regolith-init-kanshi.service
+
+[Service]
+Type=dbus
+BusName=org.gnome.Mutter.DisplayConfig
+ExecStart=/usr/bin/regolith-displayd
+Restart=on-failure
+StartLimitIntervalSec=10
+StartLimitBurst=5
+
+
+[Install]
+WantedBy=regolith-wayland.target

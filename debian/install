@@ -1,2 +1,4 @@
 target/release/regolith-displayd /usr/bin/
 regolith-displayd-init /usr/bin/
+data/regolith-init-kanshi.service /usr/lib/systemd/user/
+data/regolith-init-displayd.service /usr/lib/systemd/user/

@@ -1,4 +1,4 @@
-regolith-displayd (0.2.6) jammy; urgency=medium
+regolith-displayd (0.3.0) jammy; urgency=medium
 
   [ Soumya Ranjan Patnaik ]
   * fix: use systemd to synchronize statrup for displayd and kanshi (#5)

@@ -24,6 +24,4 @@ else
 	echo "FOUND $PROFILES_COUNT profiles" 
 fi
 
-# Start regolith-displayd if not already running
-killall /usr/bin/regolith-displayd -u $USER|| true
 /usr/bin/regolith-displayd

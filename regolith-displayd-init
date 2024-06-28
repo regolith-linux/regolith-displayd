@@ -23,5 +23,3 @@ if [ "$PROFILES_COUNT" == "0" ]; then
 else
 	echo "FOUND $PROFILES_COUNT profiles" 
 fi
-
-/usr/bin/regolith-displayd

@@ -1,5 +1,5 @@
 use crate::modes::Modes;
-use log::{error, warn};
+use log::warn;
 use num;
 use num_derive::FromPrimitive;
 use serde::{Deserialize, Serialize};

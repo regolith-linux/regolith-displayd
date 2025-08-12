@@ -116,7 +116,7 @@ impl DisplayServer {
         // Profile Write buffer (Only written if no errors occur)
         let mut profile_buf = Vec::new();
 
-        let mut active_mons = Vec::new();
+        let mut active_physical_monitors = Vec::new();
 
         writeln!(&mut profile_buf, "profile {{").unwrap();
         for mutter_logical_mointor in &mutter_logical_monitors {
@@ -131,21 +131,18 @@ impl DisplayServer {
                     }
                 }
             }
-            if let Some(sway_logical_monitor) =
-                mutter_logical_mointor.search_logical_monitor(&manager_obj.logical_monitors)
-            {
-                active_mons.push(sway_logical_monitor);
-            }
             let Some(sway_physical_monitor) = mutter_logical_mointor.search_monitor(&manager_obj.monitors) else {
                 continue;
             };
+
+            active_physical_monitors.push(sway_physical_monitor.clone());
             mutter_logical_mointor.save_kanshi(&mut profile_buf, &sway_physical_monitor);
         }
         if method == 0 {
             return Ok(());
         }
 
-        for disabled_mon in manager_obj.get_disabled_monitors(&active_mons) {
+        for disabled_mon in manager_obj.get_disabled_monitors(&active_physical_monitors) {
             writeln!(
                 &mut profile_buf,
                 "\toutput \"{}\" disable",
@@ -262,10 +259,10 @@ impl DisplayManager {
     }
 
     /// Get list of all the monitors that are not active
-    fn get_disabled_monitors(&self, active_mons: &Vec<&LogicalMonitor>) -> Vec<&LogicalMonitor> {
-        self.logical_monitors
+    fn get_disabled_monitors(&self, active_physical_monitors: &[Monitor]) -> Vec<&Monitor> {
+        self.monitors
             .iter()
-            .filter(|mon| !active_mons.contains(mon))
+            .filter(|mon| !active_physical_monitors.contains(mon))
             .collect()
     }
 

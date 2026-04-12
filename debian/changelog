@@ -1,3 +1,9 @@
+regolith-displayd (0.3.4) jammy; urgency=medium
+
+  * Update for resolute
+
+ -- Ken Gilmer <regolith.linux@gmail.com>  Sun, 12 Apr 2026 09:05:32 -0700
+
 regolith-displayd (0.3.3) jammy; urgency=medium
 
   [ Khosrow Moossavi ]

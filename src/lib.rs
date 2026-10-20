@@ -87,6 +87,18 @@ impl DisplayServer {
             error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
             return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
         }
+        // Verify the whole configuration before changing anything: an Apply
+        // that cannot be satisfied is rejected atomically, and a verify call
+        // must leave no state behind. The kanshi profile is written and the
+        // reload triggered only when every requested monitor, mode, scale and
+        // transform is valid.
+        for mutter_logical_mointor in &mutter_logical_monitors {
+            mutter_logical_mointor.verify(&self.sway_connection, &manager_obj.monitors)?;
+        }
+        if method == 0 {
+            return Ok(());
+        }
+
         let get_dpy_name = |mon: &MonitorApply| {
             let monitor = mon.search_monitor(&manager_obj.monitors).unwrap();
             monitor.get_dpy_name().replace(" ", "_")
@@ -105,14 +117,6 @@ impl DisplayServer {
 
         let kanshi_paths = get_kanshi_paths().await?;
 
-        fs::create_dir_all(&kanshi_paths.profiles).unwrap();
-        let mut profile_file = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(kanshi_paths.profiles.join(&profile_name))
-            .expect("Error while opening profile file for writing");
-
         // Profile Write buffer (Only written if no errors occur)
         let mut profile_buf = Vec::new();
 
@@ -120,26 +124,12 @@ impl DisplayServer {
 
         writeln!(&mut profile_buf, "profile {{").unwrap();
         for mutter_logical_mointor in &mutter_logical_monitors {
-            // If apply_monitors_config called with method == 0 (Verify configuration)
-            if method == 0 {
-                match mutter_logical_mointor.verify(&self.sway_connection, &manager_obj.monitors) {
-                    Ok(_) => {
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
-            }
             let Some(sway_physical_monitor) = mutter_logical_mointor.search_monitor(&manager_obj.monitors) else {
                 continue;
             };
 
             active_physical_monitors.push(sway_physical_monitor.clone());
             mutter_logical_mointor.save_kanshi(&mut profile_buf, &sway_physical_monitor);
-        }
-        if method == 0 {
-            return Ok(());
         }
 
         for disabled_mon in manager_obj.get_disabled_monitors(&active_physical_monitors) {
@@ -152,6 +142,14 @@ impl DisplayServer {
         }
         writeln!(&mut profile_buf, "}}").unwrap();
         manager_obj.properties = properties;
+
+        fs::create_dir_all(&kanshi_paths.profiles).unwrap();
+        let mut profile_file = File::options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(kanshi_paths.profiles.join(&profile_name))
+            .expect("Error while opening profile file for writing");
 
         if let Err(e) = profile_file.write(&profile_buf) {
             error!("Error writing data to kanshi config file: {e}");

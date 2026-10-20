@@ -847,6 +847,7 @@ dependencies = [
  "num-traits",
  "pretty_env_logger",
  "serde",
+ "serde_json",
  "swayipc-async",
  "tokio",
  "trawlcat",

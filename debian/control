@@ -9,7 +9,7 @@ Homepage: <https://github.com/regolith-linux/regolith-displayd>
 Package: regolith-displayd
 Architecture: any
 Multi-Arch: foreign
-Depends: ${misc:Depends}, ${shlibs:Depends}, kanshi
+Depends: ${misc:Depends}, ${shlibs:Depends}, kanshi, procps
 Recommends: gnome-control-center
 Description: Daemon for enabling inter-op between 
   gnome-control-center display panel and sway 

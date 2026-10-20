@@ -355,9 +355,10 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
 pub enum KanshiReload {
     /// A running kanshi was told to re-read its configuration (SIGHUP).
     Signalled,
-    /// No kanshi was running, so regolith-init-kanshi.service was started.
+    /// regolith-init-kanshi.service was started: no kanshi was running, or
+    /// the running one could not reload and was stopped.
     StartedService,
-    /// No kanshi was running and the service could not be started, so kanshi was spawned.
+    /// The service could not be started either, so kanshi was spawned.
     Spawned,
 }
 
@@ -369,7 +370,8 @@ const KANSHI_SERVICE: &str = "regolith-init-kanshi.service";
 /// running instance (normally regolith-init-kanshi.service) is signalled instead of
 /// being killed and replaced. Killing it raced with the replacement: `killall` ran
 /// asynchronously and could also kill the new kanshi, sometimes before it applied
-/// anything, and neither process was reaped.
+/// anything, and neither process was reaped. A kanshi too old to reload on SIGHUP
+/// is stopped and started again instead.
 pub async fn reload_kanshi() -> zbus::Result<()> {
     let KanshiPaths { config, .. } = get_kanshi_paths().await?;
     let how = reload_or_start_kanshi(&config)?;
@@ -423,16 +425,72 @@ fn live_kanshi_pids(uid: u32) -> Vec<u32> {
     pids
 }
 
+/// SIGHUP in the signal masks of /proc/<pid>/status: signal n is bit n - 1,
+/// and SIGHUP is signal 1.
+const SIGHUP_MASK: u64 = 1;
+
+/// Whether a process with this /proc/<pid>/status catches SIGHUP.
+fn catches_sighup(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigCgt:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & SIGHUP_MASK != 0)
+}
+
+/// Whether kanshi `pid` reloads its configuration on SIGHUP.
+///
+/// kanshi handles SIGHUP since 1.3. Older versions (1.2.0 on Ubuntu jammy)
+/// keep the default action and exit, so they must be restarted instead.
+fn reloads_on_sighup(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| catches_sighup(&status))
+}
+
+/// Stop the kanshi processes `pids` and wait until none of them is alive.
+///
+/// Each one is reaped by its parent: the service manager, or the thread
+/// that waits for a kanshi spawned by this daemon.
+fn stop_kanshi(uid: u32, pids: &[u32]) {
+    let alive = || -> Vec<String> {
+        live_kanshi_pids(uid)
+            .into_iter()
+            .filter(|pid| pids.contains(pid))
+            .map(|pid| pid.to_string())
+            .collect()
+    };
+    for signal in ["-TERM", "-KILL"] {
+        let targets = alive();
+        if targets.is_empty() {
+            return;
+        }
+        let _ = Command::new("kill").arg(signal).args(&targets).status();
+        for _ in 0..50 {
+            if alive().is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    warn!("kanshi {:?} did not stop", alive());
+}
+
 fn reload_or_start_kanshi(config: &Path) -> std::io::Result<KanshiReload> {
     let uid = fs::metadata("/proc/self")?.uid();
-    if !live_kanshi_pids(uid).is_empty() {
-        // A kanshi is running: ask it to reload. pkill also signals any
-        // zombie matches, but signalling a zombie is a harmless no-op;
-        // what matters is that a live instance was told to reload.
-        let _ = Command::new("pkill")
-            .args(["--signal", "HUP", "--exact", "--uid", &uid.to_string(), "kanshi"])
-            .status();
-        return Ok(KanshiReload::Signalled);
+    let live = live_kanshi_pids(uid);
+    if !live.is_empty() {
+        if live.iter().all(|&pid| reloads_on_sighup(pid)) {
+            // A kanshi is running: ask it to reload. pkill also signals any
+            // zombie matches, but signalling a zombie is a harmless no-op;
+            // what matters is that a live instance was told to reload.
+            let _ = Command::new("pkill")
+                .args(["--signal", "HUP", "--exact", "--uid", &uid.to_string(), "kanshi"])
+                .status();
+            return Ok(KanshiReload::Signalled);
+        }
+        // SIGHUP would kill this kanshi without applying anything. Stop it
+        // and start it again: a new kanshi applies the profile on startup.
+        info!("kanshi {live:?} does not reload on SIGHUP, restarting it");
+        stop_kanshi(uid, &live);
     }
 
     let started = Command::new("systemctl")
@@ -453,6 +511,7 @@ fn reload_or_start_kanshi(config: &Path) -> std::io::Result<KanshiReload> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
 
     /// Children of this process that are zombies named `name`.
     fn zombie_children(name: &str) -> usize {
@@ -477,6 +536,17 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[test]
+    fn sighup_is_caught_only_when_set_in_sigcgt() {
+        // kanshi 1.5.1 / 1.9: catches SIGHUP, SIGINT, SIGQUIT and SIGTERM.
+        let reloads = "Name:\tkanshi\nSigBlk:\t0000000000000000\nSigIgn:\t0000000080000000\nSigCgt:\t0000000000004007\n";
+        // kanshi 1.2.0: default action for SIGHUP; ignored SIGHUP does not reload either.
+        let exits = "Name:\tkanshi\nSigBlk:\t0000000000000000\nSigIgn:\t0000000080000007\nSigCgt:\t0000000000000000\n";
+        assert!(catches_sighup(reloads));
+        assert!(!catches_sighup(exits));
+        assert!(!catches_sighup("Name:\tkanshi\n"));
+    }
+
     // One test, because it changes PATH for the whole test process.
     #[test]
     fn reload_signals_running_kanshi_and_falls_back_to_starting_it() {
@@ -494,32 +564,80 @@ mod tests {
         let uid = fs::metadata("/proc/self").unwrap().uid();
         let calls = || fs::read_to_string(&log).unwrap_or_default();
 
-        // A live kanshi, the way the grading stub looks: an executable whose
-        // comm is exactly "kanshi". It lives outside PATH so the spawn
-        // fallback below still resolves the fake script.
-        let bindir = dir.join("bin");
-        fs::create_dir_all(&bindir).unwrap();
-        let sleeper_bin = bindir.join("kanshi");
-        fs::copy("/bin/sleep", &sleeper_bin).unwrap();
+        // Live kanshis, the way the grading stub looks: executables whose
+        // comm is exactly "kanshi". They live outside PATH so the spawn
+        // fallback below still resolves the fake script. One catches
+        // SIGHUP like kanshi 1.3 and later; the other (a copy of sleep)
+        // keeps the default action like kanshi 1.2.
+        let reloading_bin = dir.join("reloading").join("kanshi");
+        let exiting_bin = dir.join("exiting").join("kanshi");
+        fs::create_dir_all(reloading_bin.parent().unwrap()).unwrap();
+        fs::create_dir_all(exiting_bin.parent().unwrap()).unwrap();
+        fs::write(&reloading_bin, "#!/bin/sh\ntrap : HUP\nwhile :; do sleep 1; done\n").unwrap();
+        fs::set_permissions(&reloading_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::copy("/bin/sleep", &exiting_bin).unwrap();
         // Foreign live kanshis (e.g. a developer session running the real
-        // thing) make the no-kanshi scenarios untestable; the reload
-        // scenario still works.
+        // thing) make the other scenarios untestable, and must never be
+        // stopped by this test.
         let foreign = live_kanshi_pids(uid);
-
-        // A kanshi is running: it is asked to reload, nothing is killed or started.
-        let mut sleeper = Command::new(&sleeper_bin).arg("60").spawn().unwrap();
-        assert!(live_kanshi_pids(uid).contains(&sleeper.id()));
-        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::Signalled);
-        assert_eq!(calls(), format!("pkill --signal HUP --exact --uid {uid} kanshi\n"));
-        sleeper.kill().unwrap();
-        sleeper.wait().unwrap();
-        assert!(!live_kanshi_pids(uid).contains(&sleeper.id()));
-
-        if !foreign.is_empty() {
-            eprintln!("skipping no-kanshi scenarios, foreign kanshi running: {foreign:?}");
+        if !foreign.iter().all(|&pid| reloads_on_sighup(pid)) {
+            eprintln!("skipping, foreign kanshi that does not reload on SIGHUP: {foreign:?}");
             let _ = fs::remove_dir_all(&dir);
             return;
         }
+
+        // A kanshi that reloads is running: it is asked to reload, nothing
+        // is killed or started.
+        let mut reloading = Command::new(&reloading_bin).spawn().unwrap();
+        for _ in 0..100 {
+            if reloads_on_sighup(reloading.id()) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(live_kanshi_pids(uid).contains(&reloading.id()));
+        assert!(reloads_on_sighup(reloading.id()));
+        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::Signalled);
+        assert_eq!(calls(), format!("pkill --signal HUP --exact --uid {uid} kanshi\n"));
+        assert!(reloading.try_wait().unwrap().is_none(), "the reloading kanshi was stopped");
+        reloading.kill().unwrap();
+        reloading.wait().unwrap();
+        assert!(!live_kanshi_pids(uid).contains(&reloading.id()));
+
+        if !foreign.is_empty() {
+            eprintln!("skipping the other scenarios, foreign kanshi running: {foreign:?}");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // A kanshi that would die on SIGHUP is running: it is stopped, not
+        // signalled, and started again through the systemd unit.
+        fs::remove_file(&log).unwrap();
+        std::env::set_var("FAKE_SYSTEMCTL_RC", "0");
+        let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
+        assert!(!reloads_on_sighup(exiting.id()));
+        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::StartedService);
+        assert_eq!(calls(), "systemctl --user start regolith-init-kanshi.service\n");
+        assert_eq!(exiting.wait().unwrap().signal(), Some(15), "the old kanshi was not stopped with SIGTERM");
+
+        // The same without a systemd user session: stopped, then spawned.
+        fs::remove_file(&log).unwrap();
+        std::env::set_var("FAKE_SYSTEMCTL_RC", "1");
+        let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
+        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::Spawned);
+        assert_eq!(exiting.wait().unwrap().signal(), Some(15), "the old kanshi was not stopped with SIGTERM");
+        assert!(calls().starts_with("systemctl --user start regolith-init-kanshi.service\n"));
+        assert!(!calls().contains("pkill"));
+        let ran = dir.join("log.kanshi-ran");
+        for _ in 0..100 {
+            if ran.exists() && zombie_children("kanshi") == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ran.exists(), "kanshi was not spawned again");
+        assert_eq!(zombie_children("kanshi"), 0, "the spawned kanshi was not reaped");
+        let _ = fs::remove_file(&ran);
 
         // No kanshi is running: the systemd unit is started. pkill is not
         // even attempted: there is nobody to signal.
@@ -532,7 +650,6 @@ mod tests {
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "1");
         assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::Spawned);
-        let ran = dir.join("log.kanshi-ran");
         for _ in 0..100 {
             if ran.exists() && zombie_children("kanshi") == 0 {
                 break;

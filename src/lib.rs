@@ -483,7 +483,14 @@ fn reload_or_start_kanshi(config: &Path) -> std::io::Result<KanshiReload> {
             // zombie matches, but signalling a zombie is a harmless no-op;
             // what matters is that a live instance was told to reload.
             let _ = Command::new("pkill")
-                .args(["--signal", "HUP", "--exact", "--uid", &uid.to_string(), "kanshi"])
+                .args([
+                    "--signal",
+                    "HUP",
+                    "--exact",
+                    "--uid",
+                    &uid.to_string(),
+                    "kanshi",
+                ])
                 .status();
             return Ok(KanshiReload::Signalled);
         }
@@ -496,7 +503,7 @@ fn reload_or_start_kanshi(config: &Path) -> std::io::Result<KanshiReload> {
     let started = Command::new("systemctl")
         .args(["--user", "start", KANSHI_SERVICE])
         .status()
-        .map_or(false, |status| status.success());
+        .is_ok_and(|status| status.success());
     if started {
         return Ok(KanshiReload::StartedService);
     }
@@ -525,14 +532,20 @@ mod tests {
                     return false;
                 };
                 let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-                &stat[open + 1..close] == name && rest.first() == Some(&"Z") && rest.get(1) == Some(&me.as_str())
+                &stat[open + 1..close] == name
+                    && rest.first() == Some(&"Z")
+                    && rest.get(1) == Some(&me.as_str())
             })
             .count()
     }
 
     fn fake_tool(dir: &Path, name: &str, body: &str) {
         let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >> \"$FAKE_LOG\"\n{body}\n")).unwrap();
+        fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"{name} $*\" >> \"$FAKE_LOG\"\n{body}\n"),
+        )
+        .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -573,7 +586,11 @@ mod tests {
         let exiting_bin = dir.join("exiting").join("kanshi");
         fs::create_dir_all(reloading_bin.parent().unwrap()).unwrap();
         fs::create_dir_all(exiting_bin.parent().unwrap()).unwrap();
-        fs::write(&reloading_bin, "#!/bin/sh\ntrap : HUP\nwhile :; do sleep 1; done\n").unwrap();
+        fs::write(
+            &reloading_bin,
+            "#!/bin/sh\ntrap : HUP\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
         fs::set_permissions(&reloading_bin, fs::Permissions::from_mode(0o755)).unwrap();
         fs::copy("/bin/sleep", &exiting_bin).unwrap();
         // Foreign live kanshis (e.g. a developer session running the real
@@ -597,9 +614,18 @@ mod tests {
         }
         assert!(live_kanshi_pids(uid).contains(&reloading.id()));
         assert!(reloads_on_sighup(reloading.id()));
-        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::Signalled);
-        assert_eq!(calls(), format!("pkill --signal HUP --exact --uid {uid} kanshi\n"));
-        assert!(reloading.try_wait().unwrap().is_none(), "the reloading kanshi was stopped");
+        assert_eq!(
+            reload_or_start_kanshi(&config).unwrap(),
+            KanshiReload::Signalled
+        );
+        assert_eq!(
+            calls(),
+            format!("pkill --signal HUP --exact --uid {uid} kanshi\n")
+        );
+        assert!(
+            reloading.try_wait().unwrap().is_none(),
+            "the reloading kanshi was stopped"
+        );
         reloading.kill().unwrap();
         reloading.wait().unwrap();
         assert!(!live_kanshi_pids(uid).contains(&reloading.id()));
@@ -616,16 +642,33 @@ mod tests {
         std::env::set_var("FAKE_SYSTEMCTL_RC", "0");
         let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
         assert!(!reloads_on_sighup(exiting.id()));
-        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::StartedService);
-        assert_eq!(calls(), "systemctl --user start regolith-init-kanshi.service\n");
-        assert_eq!(exiting.wait().unwrap().signal(), Some(15), "the old kanshi was not stopped with SIGTERM");
+        assert_eq!(
+            reload_or_start_kanshi(&config).unwrap(),
+            KanshiReload::StartedService
+        );
+        assert_eq!(
+            calls(),
+            "systemctl --user start regolith-init-kanshi.service\n"
+        );
+        assert_eq!(
+            exiting.wait().unwrap().signal(),
+            Some(15),
+            "the old kanshi was not stopped with SIGTERM"
+        );
 
         // The same without a systemd user session: stopped, then spawned.
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "1");
         let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
-        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::Spawned);
-        assert_eq!(exiting.wait().unwrap().signal(), Some(15), "the old kanshi was not stopped with SIGTERM");
+        assert_eq!(
+            reload_or_start_kanshi(&config).unwrap(),
+            KanshiReload::Spawned
+        );
+        assert_eq!(
+            exiting.wait().unwrap().signal(),
+            Some(15),
+            "the old kanshi was not stopped with SIGTERM"
+        );
         assert!(calls().starts_with("systemctl --user start regolith-init-kanshi.service\n"));
         assert!(!calls().contains("pkill"));
         let ran = dir.join("log.kanshi-ran");
@@ -636,20 +679,33 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(ran.exists(), "kanshi was not spawned again");
-        assert_eq!(zombie_children("kanshi"), 0, "the spawned kanshi was not reaped");
+        assert_eq!(
+            zombie_children("kanshi"),
+            0,
+            "the spawned kanshi was not reaped"
+        );
         let _ = fs::remove_file(&ran);
 
         // No kanshi is running: the systemd unit is started. pkill is not
         // even attempted: there is nobody to signal.
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "0");
-        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::StartedService);
-        assert_eq!(calls(), "systemctl --user start regolith-init-kanshi.service\n");
+        assert_eq!(
+            reload_or_start_kanshi(&config).unwrap(),
+            KanshiReload::StartedService
+        );
+        assert_eq!(
+            calls(),
+            "systemctl --user start regolith-init-kanshi.service\n"
+        );
 
         // No kanshi and no systemd user session: kanshi is spawned and reaped.
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "1");
-        assert_eq!(reload_or_start_kanshi(&config).unwrap(), KanshiReload::Spawned);
+        assert_eq!(
+            reload_or_start_kanshi(&config).unwrap(),
+            KanshiReload::Spawned
+        );
         for _ in 0..100 {
             if ran.exists() && zombie_children("kanshi") == 0 {
                 break;
@@ -658,7 +714,11 @@ mod tests {
         }
         assert!(ran.exists(), "kanshi was not spawned");
         assert!(calls().ends_with(&format!("kanshi -c {}\n", config.display())));
-        assert_eq!(zombie_children("kanshi"), 0, "the spawned kanshi was not reaped");
+        assert_eq!(
+            zombie_children("kanshi"),
+            0,
+            "the spawned kanshi was not reaped"
+        );
         assert!(!calls().contains("killall"));
 
         let _ = fs::remove_dir_all(&dir);

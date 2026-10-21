@@ -842,6 +842,7 @@ version = "0.1.0"
 dependencies = [
  "lazy_static",
  "log",
+ "nix",
  "num",
  "num-derive",
  "num-traits",

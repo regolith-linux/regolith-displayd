@@ -1,17 +1,19 @@
-//! The gamma thread against a fake compositor that offers wl_output and
+//! The gamma client against a fake compositor that offers wl_output and
 //! wlr-gamma-control and records the tables it is given.
 
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 use nix::sys::uio::IoVec;
-use regolith_displayd::gamma::{self, Command};
+use regolith_displayd::gamma;
 use regolith_displayd::night_light::{gamma_table, NEUTRAL_TEMPERATURE};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc;
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+use tokio::sync::watch;
 
 const MANAGER_NAME: u32 = 100;
 
@@ -39,6 +41,8 @@ struct FakeCompositor {
     registry: Option<u32>,
     /// Gamma ramp size of each output, by registry name.
     sizes: HashMap<u32, u32>,
+    /// Outputs whose gamma control is refused (another client holds it).
+    refused: HashSet<u32>,
 }
 
 fn word(data: &[u8], at: usize) -> u32 {
@@ -64,6 +68,7 @@ impl FakeCompositor {
             objects: HashMap::from([(1, Object::Display)]),
             registry: None,
             sizes: HashMap::new(),
+            refused: HashSet::new(),
         }
     }
 
@@ -119,10 +124,23 @@ impl FakeCompositor {
         self.buffer.extend_from_slice(&chunk[..bytes]);
     }
 
+    /// Wait until the client closes the connection, ignoring its requests.
+    fn expect_disconnect(&mut self) {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(_) => continue,
+                Err(e) => panic!("the client did not disconnect: {e}"),
+            }
+        }
+    }
+
     /// Serve the client until it sends a request the test looks at.
     fn next(&mut self) -> Request {
         loop {
-            while self.buffer.len() < 8 || self.buffer.len() < (word(&self.buffer, 4) >> 16) as usize
+            while self.buffer.len() < 8
+                || self.buffer.len() < (word(&self.buffer, 4) >> 16) as usize
             {
                 self.fill();
             }
@@ -130,7 +148,10 @@ impl FakeCompositor {
             let message: Vec<u8> = self.buffer.drain(..size).collect();
             let (object, opcode) = (word(&message, 0), word(&message, 4) & 0xffff);
             let args = &message[8..];
-            let kind = *self.objects.get(&object).expect("request on unknown object");
+            let kind = *self
+                .objects
+                .get(&object)
+                .expect("request on unknown object");
             match (kind, opcode) {
                 (Object::Display, 0) => self.event(word(args, 0), 0, &0u32.to_ne_bytes()),
                 (Object::Display, 1) => {
@@ -163,8 +184,12 @@ impl FakeCompositor {
                         panic!("gamma control for unknown output {output}");
                     };
                     self.objects.insert(control, Object::Control(name));
-                    let size = self.sizes[&name];
-                    self.event(control, 0, &size.to_ne_bytes());
+                    if self.refused.contains(&name) {
+                        self.event(control, 1, &[]);
+                    } else {
+                        let size = self.sizes[&name];
+                        self.event(control, 0, &size.to_ne_bytes());
+                    }
                 }
                 (Object::Control(output), 0) => {
                     let fd = self.fds.pop_front().expect("set_gamma without a file");
@@ -174,7 +199,7 @@ impl FakeCompositor {
                     file.read_to_end(&mut bytes).unwrap();
                     let table = bytes
                         .chunks(2)
-                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .map(|b| u16::from_ne_bytes([b[0], b[1]]))
                         .collect();
                     return Request::SetGamma { output, table };
                 }
@@ -206,30 +231,67 @@ impl FakeCompositor {
     }
 }
 
+/// The tests point WAYLAND_DISPLAY at their own socket, so they take turns.
+static DISPLAY: Mutex<()> = Mutex::new(());
+
+struct Setup {
+    listener: UnixListener,
+    dir: PathBuf,
+    _display: MutexGuard<'static, ()>,
+}
+
+impl Setup {
+    fn new(name: &str) -> Self {
+        let display = DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("displayd-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("wayland-test");
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        // An absolute WAYLAND_DISPLAY is used as is, as libwayland does.
+        std::env::set_var("WAYLAND_DISPLAY", &socket);
+        Setup {
+            listener,
+            dir,
+            _display: display,
+        }
+    }
+
+    /// Start the gamma client on its own thread, as the daemon does.
+    fn start(&self) -> watch::Sender<u32> {
+        let (sink, temperature) = watch::channel(NEUTRAL_TEMPERATURE);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(gamma::run(temperature))
+        });
+        sink
+    }
+}
+
+impl Drop for Setup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[test]
 fn applies_temperature_to_every_output() {
-    let dir = std::env::temp_dir().join(format!("displayd-gamma-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("wayland-test");
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).unwrap();
-    // An absolute WAYLAND_DISPLAY is used as is, as libwayland does.
-    std::env::set_var("WAYLAND_DISPLAY", &socket);
-
-    let (sink, commands) = mpsc::channel();
-    let events = sink.clone();
-    std::thread::spawn(move || gamma::run(commands, events));
-    let mut compositor = FakeCompositor::accept(&listener);
+    let setup = Setup::new("gamma-test");
+    let sink = setup.start();
+    let mut compositor = FakeCompositor::accept(&setup.listener);
     compositor.sizes.insert(1, 256);
     compositor.sizes.insert(2, 1024);
 
     // Night Light turns on: each output gets a table of its own size.
-    sink.send(Command::Temperature(2700)).unwrap();
+    sink.send(2700).unwrap();
     let tables = compositor.tables(&[1, 2]);
     assert_eq!(tables[&1], gamma_table(2700, 256));
     assert_eq!(tables[&2], gamma_table(2700, 1024));
 
-    sink.send(Command::Temperature(3500)).unwrap();
+    sink.send(3500).unwrap();
     let tables = compositor.tables(&[1, 2]);
     assert_eq!(tables[&2], gamma_table(3500, 1024));
 
@@ -242,10 +304,64 @@ fn applies_temperature_to_every_output() {
     assert_eq!(compositor.next(), Request::Destroy { output: 2 });
 
     // Night Light turns off: the identity is written, the controls stay.
-    sink.send(Command::Temperature(NEUTRAL_TEMPERATURE)).unwrap();
+    sink.send(NEUTRAL_TEMPERATURE).unwrap();
     let tables = compositor.tables(&[1, 3]);
     assert_eq!(tables[&1], gamma_table(NEUTRAL_TEMPERATURE, 256));
     assert_eq!(tables[&3], gamma_table(NEUTRAL_TEMPERATURE, 4096));
 
-    let _ = std::fs::remove_dir_all(&dir);
+    // The daemon stops: the connection closes, so the compositor restores
+    // the outputs' own tables.
+    drop(sink);
+    compositor.expect_disconnect();
+}
+
+#[test]
+fn retries_refused_outputs_and_reconnects() {
+    let setup = Setup::new("gamma-retry-test");
+    let sink = setup.start();
+    let mut compositor = FakeCompositor::accept(&setup.listener);
+    compositor.sizes.insert(1, 256);
+    compositor.sizes.insert(2, 256);
+    // Another gamma tool holds output 2.
+    compositor.refused.insert(2);
+
+    // The refused control is destroyed; output 1 still gets its table.
+    sink.send(3000).unwrap();
+    let mut table = None;
+    let mut destroyed = false;
+    while table.is_none() || !destroyed {
+        match compositor.next() {
+            Request::SetGamma {
+                output: 1,
+                table: t,
+            } => table = Some(t),
+            Request::Destroy { output: 2 } => destroyed = true,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(table.unwrap(), gamma_table(3000, 256));
+
+    // The other tool quits. Output 2 is tried again the next time Night
+    // Light turns on.
+    compositor.refused.clear();
+    sink.send(NEUTRAL_TEMPERATURE).unwrap();
+    assert_eq!(
+        compositor.tables(&[1])[&1],
+        gamma_table(NEUTRAL_TEMPERATURE, 256)
+    );
+    sink.send(2700).unwrap();
+    let tables = compositor.tables(&[1, 2]);
+    assert_eq!(tables[&1], gamma_table(2700, 256));
+    assert_eq!(tables[&2], gamma_table(2700, 256));
+
+    // The compositor goes away and comes back (a new sway): the client
+    // connects again and applies the current temperature.
+    let sizes = compositor.sizes.clone();
+    drop(compositor);
+    sink.send(2000).unwrap();
+    let mut compositor = FakeCompositor::accept(&setup.listener);
+    compositor.sizes = sizes;
+    let tables = compositor.tables(&[1, 2]);
+    assert_eq!(tables[&1], gamma_table(2000, 256));
+    assert_eq!(tables[&2], gamma_table(2000, 256));
 }

@@ -23,7 +23,7 @@ wayland-client = "0.31"
 ab_glyph = "0.2"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 rustix = { version = "1", features = ["fs"] }
-nix = "0.23"
 
 [dev-dependencies]
 serde_json = "1"
+nix = "0.23"

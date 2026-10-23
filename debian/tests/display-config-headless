@@ -4,7 +4,8 @@
 # verify must write nothing, an unsatisfiable Apply must fail without writing,
 # and an Apply must change the scale in sway, keep exactly one kanshi alive
 # (reloaded in place, or restarted when it cannot reload on SIGHUP) and leave
-# no zombie processes.
+# no zombie processes. With two outputs that report the same description, the
+# profile must name them by connector so that kanshi accepts it.
 set -euo pipefail
 
 work=$(mktemp -d)
@@ -212,6 +213,50 @@ if ! systemctl --user show-environment > /dev/null 2>&1; then
     [ "$(zombie_children)" = 0 ] || fail "regolith-displayd left zombie children"
     echo "ok: with no kanshi running, Apply started kanshi $spawned$([ "$scale_checks" = yes ] && echo " and the scale took effect")"
 fi
+
+# Two monitors with the same make, model and serial: every headless output
+# reports the same description. The profile must tell them apart by connector,
+# because kanshi 1.7 and later reject a profile that names an output twice,
+# and with it every other profile. Such a profile, saved by an earlier
+# version, must not keep kanshi from loading the new one.
+desc=$(swaymsg -t get_outputs | python3 -c 'import json, sys; o = json.load(sys.stdin)[0]; print(o["make"], o["model"], o["serial"])')
+old_profile="${desc// /_}__${desc// /_}"
+printf 'profile {\n\toutput "%s" enable\n\toutput "%s" enable\n}\n' "$desc" "$desc" > "$profiles/$old_profile"
+swaymsg -q create_output
+second=$(swaymsg -t get_outputs | python3 -c 'import json, sys; print(next(o["name"] for o in json.load(sys.stdin) if o["name"] != "HEADLESS-1"))')
+second_mode=$(swaymsg -t get_outputs | python3 -c '
+import json, sys
+mode = next(o for o in json.load(sys.stdin) if o["name"] == sys.argv[1])["current_mode"]
+print("%dx%d@%gHz" % (mode["width"], mode["height"], mode["refresh"] / 1000))' "$second")
+retry 20 sh -c "gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig --method org.gnome.Mutter.DisplayConfig.GetCurrentState | grep -q \"'$second'\"" \
+    || fail "regolith-displayd does not list $second"
+echo "outputs HEADLESS-1 and $second both report \"$desc\""
+
+# HEADLESS-1 at scale 2 (800x500 logical), $second below it, where sway would
+# not put it by itself.
+dc ApplyMonitorsConfig "$serial" 1 \
+    "[(0, 0, 2.0, 0, false, [('HEADLESS-1', '$mode', @a{sv} {})]), (0, 500, 1.0, 0, false, [('$second', '$second_mode', @a{sv} {})])]" \
+    "@a{sv} {}" > /dev/null || fail "Apply of two identical outputs failed"
+second_at() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+outputs = {o["name"]: o for o in json.load(sys.stdin)}
+first, second = outputs["HEADLESS-1"], outputs[sys.argv[1]]
+sys.exit(not (first["scale"] == 2.0 and (second["rect"]["x"], second["rect"]["y"]) == (0, 500)))' "$second"
+}
+if [ "$scale_checks" = yes ]; then
+    retry 40 second_at || fail "the layout of the two identical outputs did not take effect: $(swaymsg -t get_outputs | python3 -c '
+import json, sys
+print(" ".join("%s scale %s at %d,%d" % (o["name"], o["scale"], o["rect"]["x"], o["rect"]["y"]) for o in json.load(sys.stdin)))')"
+fi
+retry 20 live_kanshis_are "$kanshis" || fail "live kanshi count changed: $kanshis -> $(live_kanshis)"
+profile="$profiles/HEADLESS-1__$second"
+[ -f "$profile" ] || fail "no profile HEADLESS-1__$second: $(profile_files | tr '\n' ' ')"
+grep -q "output \"HEADLESS-1\" mode " "$profile" && grep -q "output \"$second\" mode " "$profile" \
+    || fail "the profile does not name the outputs by connector: $(cat "$profile")"
+[ ! -e "$profiles/$old_profile" ] && [ -f "$HOME/.config/regolith3/kanshi/invalid-profiles/$old_profile" ] \
+    || fail "the old profile that names \"$desc\" twice was not set aside"
+echo "ok: two identical outputs are saved by connector$([ "$scale_checks" = yes ] && echo " and their layout took effect"), the old profile was set aside"
 
 kill -0 "$displayd" || fail "regolith-displayd exited"
 echo "PASS"

@@ -100,48 +100,10 @@ impl DisplayServer {
             return Ok(());
         }
 
-        let get_dpy_name = |mon: &MonitorApply| {
-            let monitor = mon.search_monitor(&manager_obj.monitors).unwrap();
-            monitor.get_dpy_name().replace(" ", "_")
-        };
-
-        let mut monitors_sorted = manager_obj.monitors.clone();
-
-        monitors_sorted.sort_by_key(|monitor| monitor.get_dpy_name());
-
-        let profile_name = monitors_sorted
-            .iter()
-            .map(|mon| mon.get_dpy_name().replace(" ", "_"))
-            .collect::<Vec<String>>()
-            .join("__");
+        let (profile_name, profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
         info!("Profile FileName: {profile_name}");
 
         let kanshi_paths = get_kanshi_paths().await?;
-
-        // Profile Write buffer (Only written if no errors occur)
-        let mut profile_buf = Vec::new();
-
-        let mut active_physical_monitors = Vec::new();
-
-        writeln!(&mut profile_buf, "profile {{").unwrap();
-        for mutter_logical_mointor in &mutter_logical_monitors {
-            let Some(sway_physical_monitor) = mutter_logical_mointor.search_monitor(&manager_obj.monitors) else {
-                continue;
-            };
-
-            active_physical_monitors.push(sway_physical_monitor.clone());
-            mutter_logical_mointor.save_kanshi(&mut profile_buf, &sway_physical_monitor);
-        }
-
-        for disabled_mon in manager_obj.get_disabled_monitors(&active_physical_monitors) {
-            writeln!(
-                &mut profile_buf,
-                "\toutput \"{}\" disable",
-                disabled_mon.get_dpy_name()
-            )
-            .expect("Failed to write to file");
-        }
-        writeln!(&mut profile_buf, "}}").unwrap();
         manager_obj.properties = properties;
 
         fs::create_dir_all(&kanshi_paths.profiles).unwrap();
@@ -156,6 +118,9 @@ impl DisplayServer {
             error!("Error writing data to kanshi config file: {e}");
             return Err(zbus::fdo::Error::IOError(e.to_string()));
         }
+        // An older profile for the same identical monitors names one output
+        // twice and would still keep kanshi from loading any profile.
+        set_aside_invalid_profiles(&kanshi_paths);
 
         // reload kanshi config
         if let Err(e) = reload_kanshi().await {
@@ -190,6 +155,8 @@ impl DisplayServer {
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
+        // kanshi starts after this daemon: make sure it can load the profiles.
+        set_aside_invalid_profiles(&get_kanshi_paths().await?);
         self.manager
             .lock()
             .await
@@ -255,6 +222,56 @@ impl DisplayManager {
                 Self::emit_monitors_changed().await?;
             }
         }
+    }
+
+    /// The kanshi profile that applies `config` to the connected monitors:
+    /// its file name and its contents.
+    ///
+    /// Each monitor is named by its description, or by its connector name if
+    /// another connected monitor has the same description (see
+    /// [`Monitor::kanshi_name`]). The file name joins those names, sorted, so
+    /// the same set of monitors always maps to the same file.
+    fn kanshi_profile(&self, config: &[MonitorApply]) -> (String, Vec<u8>) {
+        let mut names: Vec<String> = self
+            .monitors
+            .iter()
+            .map(|mon| mon.kanshi_name(&self.monitors))
+            .collect();
+        names.sort();
+        let profile_name = names
+            .iter()
+            .map(|name| name.replace(' ', "_"))
+            .collect::<Vec<String>>()
+            .join("__");
+
+        let mut profile_buf = Vec::new();
+        let mut active_physical_monitors = Vec::new();
+
+        writeln!(&mut profile_buf, "profile {{").unwrap();
+        for mutter_logical_mointor in config {
+            let Some(sway_physical_monitor) = mutter_logical_mointor.search_monitor(&self.monitors)
+            else {
+                continue;
+            };
+
+            active_physical_monitors.push(sway_physical_monitor.clone());
+            mutter_logical_mointor.save_kanshi(
+                &mut profile_buf,
+                sway_physical_monitor,
+                &self.monitors,
+            );
+        }
+
+        for disabled_mon in self.get_disabled_monitors(&active_physical_monitors) {
+            writeln!(
+                &mut profile_buf,
+                "\toutput \"{}\" disable",
+                disabled_mon.kanshi_name(&self.monitors)
+            )
+            .expect("Failed to write to file");
+        }
+        writeln!(&mut profile_buf, "}}").unwrap();
+        (profile_name, profile_buf)
     }
 
     /// Get list of all the monitors that are not active
@@ -348,6 +365,70 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
     let profiles = base.join("profiles");
     let config = base.join("config");
     return Ok(KanshiPaths { profiles, config });
+}
+
+/// The output that a profile in this kanshi configuration names twice, if any.
+///
+/// kanshi 1.7 and later reject the whole configuration when a profile names
+/// the same output twice ("duplicate output"), so no profile applies at all.
+/// This daemon wrote such profiles for identical monitors before it told them
+/// apart by connector name.
+fn duplicate_output(config: &str) -> Option<String> {
+    let mut seen = HashSet::new();
+    for line in config.lines() {
+        let line = line.trim();
+        // The start or the end of a profile.
+        if line.starts_with("profile") || line.starts_with('}') {
+            seen.clear();
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("output") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let name = match rest.chars().next() {
+            Some(quote @ ('"' | '\'')) => rest[1..].split(quote).next().unwrap_or_default(),
+            _ => rest.split_whitespace().next().unwrap_or_default(),
+        };
+        if !seen.insert(name) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Move the profiles that kanshi would reject out of the profiles directory,
+/// which the kanshi configuration includes as a whole, to "invalid-profiles"
+/// next to it. One such file keeps kanshi from applying any profile.
+fn set_aside_invalid_profiles(paths: &KanshiPaths) {
+    let Ok(entries) = fs::read_dir(&paths.profiles) else {
+        return;
+    };
+    let aside = paths.profiles.with_file_name("invalid-profiles");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(profile) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(output) = duplicate_output(&profile) else {
+            continue;
+        };
+        let target = aside.join(entry.file_name());
+        match fs::create_dir_all(&aside).and_then(|_| fs::rename(&path, &target)) {
+            Ok(()) => warn!(
+                "kanshi profile {} names output \"{output}\" twice, which kanshi rejects: moved it to {}",
+                path.display(),
+                target.display()
+            ),
+            Err(e) => error!(
+                "kanshi profile {} names output \"{output}\" twice, which kanshi rejects, and could not be moved: {e}",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// How [`reload_kanshi`] got kanshi to apply the saved profiles.
@@ -547,6 +628,237 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn monitor(connector: &str, make: &str, model: &str, serial: &str) -> Monitor {
+        let output = serde_json::from_value(serde_json::json!({
+            "id": 1, "name": connector, "make": make, "model": model, "serial": serial,
+            "active": true, "dpms": true, "primary": false, "scale": 1.0, "transform": "normal",
+            "modes": [{"width": 1920, "height": 1080, "refresh": 60000}],
+            "current_mode": {"width": 1920, "height": 1080, "refresh": 60000},
+            "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}
+        }))
+        .unwrap();
+        Monitor::new(&output)
+    }
+
+    /// `connector` at `x`, the way the Displays panel applies it.
+    fn place(connector: &str, x: i32) -> MonitorApply {
+        serde_json::from_value(serde_json::json!({
+            "x_pos": x, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": false,
+            "monitors": [[connector, "1920x1080@60Hz", {}]]
+        }))
+        .unwrap()
+    }
+
+    fn profile(monitors: Vec<Monitor>, config: &[MonitorApply]) -> (String, String) {
+        let manager = DisplayManager {
+            serial: 0,
+            monitors,
+            logical_monitors: Vec::new(),
+            properties: DisplayManagerProperties::new(),
+        };
+        let (name, contents) = manager.kanshi_profile(config);
+        (name, String::from_utf8(contents).unwrap())
+    }
+
+    fn acme(connector: &str) -> Monitor {
+        monitor(connector, "Acme", "View 24", "0")
+    }
+
+    fn laptop_panel() -> Monitor {
+        monitor("eDP-1", "BOE", "0x0BCA", "Unknown")
+    }
+
+    #[test]
+    fn identical_monitors_are_named_by_connector() {
+        let (name, contents) = profile(
+            vec![acme("DP-1"), acme("DP-2")],
+            &[place("DP-1", 0), place("DP-2", 1920)],
+        );
+        assert_eq!(name, "DP-1__DP-2");
+        assert_eq!(
+            contents,
+            "profile {\n\
+             \toutput \"DP-1\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+             \toutput \"DP-2\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
+             }\n"
+        );
+        assert_eq!(duplicate_output(&contents), None);
+    }
+
+    #[test]
+    fn only_identical_monitors_are_named_by_connector() {
+        let monitors = vec![acme("DP-2"), laptop_panel(), acme("DP-1")];
+        let (name, contents) = profile(monitors, &[place("eDP-1", 0), place("DP-1", 1920)]);
+        assert_eq!(name, "BOE_0x0BCA_Unknown__DP-1__DP-2");
+        assert_eq!(
+            contents,
+            "profile {\n\
+             \toutput \"BOE 0x0BCA Unknown\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+             \toutput \"DP-1\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
+             \toutput \"DP-2\" disable\n\
+             }\n"
+        );
+    }
+
+    #[test]
+    fn distinct_monitors_are_named_by_description() {
+        // The same file name and contents as before identical monitors were
+        // told apart, so existing profiles are overwritten in place.
+        let monitors = vec![
+            monitor("DP-1", "LG", "27GL850", "007NTAB1C123"),
+            monitor("HDMI-A-1", "Dell Inc.", "DELL U2415", "7MT0167G1V0L"),
+            laptop_panel(),
+        ];
+        let (name, contents) = profile(monitors, &[place("HDMI-A-1", 0), place("DP-1", 1920)]);
+        assert_eq!(
+            name,
+            "BOE_0x0BCA_Unknown__Dell_Inc._DELL_U2415_7MT0167G1V0L__LG_27GL850_007NTAB1C123"
+        );
+        assert_eq!(
+            contents,
+            "profile {\n\
+             \toutput \"Dell Inc. DELL U2415 7MT0167G1V0L\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+             \toutput \"LG 27GL850 007NTAB1C123\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
+             \toutput \"BOE 0x0BCA Unknown\" disable\n\
+             }\n"
+        );
+    }
+
+    /// A profile for two identical monitors as written before they were told
+    /// apart: kanshi 1.7 and later reject it, and with it every profile.
+    const OLD_IDENTICAL_PROFILE: &str = "profile {\n\
+        \toutput \"Acme View 24 0\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+        \toutput \"Acme View 24 0\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
+        }\n";
+
+    #[test]
+    fn duplicate_outputs_are_found_per_profile() {
+        assert_eq!(
+            duplicate_output(OLD_IDENTICAL_PROFILE).as_deref(),
+            Some("Acme View 24 0")
+        );
+        assert_eq!(
+            duplicate_output("profile {\n  output DP-1 enable\n  output DP-1 disable\n}\n")
+                .as_deref(),
+            Some("DP-1")
+        );
+        // The same output in two profiles, and the dummy profile.
+        let two_profiles = "profile a {\n\toutput \"Acme View 24 0\" enable\n}\n\
+                            profile b {\n\toutput \"Acme View 24 0\" disable\n}\n";
+        assert_eq!(duplicate_output(two_profiles), None);
+        assert_eq!(duplicate_output("profile {}\n"), None);
+    }
+
+    #[test]
+    fn profiles_kanshi_rejects_are_set_aside() {
+        let dir =
+            std::env::temp_dir().join(format!("displayd-profiles-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = KanshiPaths {
+            profiles: dir.join("profiles"),
+            config: dir.join("config"),
+        };
+        fs::create_dir_all(&paths.profiles).unwrap();
+        let (name, contents) = profile(
+            vec![acme("DP-1"), acme("DP-2")],
+            &[place("DP-1", 0), place("DP-2", 1920)],
+        );
+        fs::write(paths.profiles.join(&name), &contents).unwrap();
+        fs::write(
+            paths.profiles.join("Acme_View_24_0__Acme_View_24_0"),
+            OLD_IDENTICAL_PROFILE,
+        )
+        .unwrap();
+        fs::write(paths.profiles.join("dummy"), "profile {}\n").unwrap();
+
+        set_aside_invalid_profiles(&paths);
+
+        let mut kept: Vec<String> = fs::read_dir(&paths.profiles)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["DP-1__DP-2", "dummy"]);
+        assert_eq!(
+            fs::read_to_string(dir.join("invalid-profiles/Acme_View_24_0__Acme_View_24_0"))
+                .unwrap(),
+            OLD_IDENTICAL_PROFILE
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Run kanshi on `config` without a compositor. kanshi parses its
+    /// configuration first, so it only gets to "failed to connect to display"
+    /// when the configuration is valid.
+    fn kanshi_parse(kanshi: &Path, dir: &Path, config: &Path) -> String {
+        // Through a link with another name, so the reload test does not take
+        // it for a running kanshi.
+        let link = dir.join("kanshi-parse");
+        if !link.exists() {
+            std::os::unix::fs::symlink(kanshi, &link).unwrap();
+        }
+        let output = Command::new(&link)
+            .arg("-c")
+            .arg(config)
+            .env("XDG_RUNTIME_DIR", dir)
+            .env("WAYLAND_DISPLAY", "no-compositor")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    #[test]
+    fn kanshi_accepts_profiles_for_identical_monitors() {
+        let kanshi = Path::new("/usr/bin/kanshi");
+        if !kanshi.exists() {
+            eprintln!("skipping, kanshi is not installed");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("displayd-kanshi-parse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let profiles = dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        let config = dir.join("config");
+        fs::write(&config, format!("include {}/*\n", profiles.display())).unwrap();
+        let configs = [
+            (
+                vec![acme("DP-1"), acme("DP-2")],
+                vec![place("DP-1", 0), place("DP-2", 1920)],
+            ),
+            (
+                vec![laptop_panel(), acme("DP-1"), acme("DP-2")],
+                vec![place("eDP-1", 0), place("DP-2", 1920)],
+            ),
+            (
+                vec![
+                    laptop_panel(),
+                    monitor("DP-1", "LG", "27GL850", "007NTAB1C123"),
+                ],
+                vec![place("DP-1", 0)],
+            ),
+        ];
+        for (monitors, config) in configs {
+            let (name, contents) = profile(monitors, &config);
+            fs::write(profiles.join(name), contents).unwrap();
+        }
+        let stderr = kanshi_parse(kanshi, &dir, &config);
+        assert!(
+            stderr.contains("failed to connect to display"),
+            "kanshi rejected the profiles: {stderr}"
+        );
+
+        // The old profile, for comparison: kanshi 1.7 and later reject it.
+        fs::write(
+            profiles.join("Acme_View_24_0__Acme_View_24_0"),
+            OLD_IDENTICAL_PROFILE,
+        )
+        .unwrap();
+        let stderr = kanshi_parse(kanshi, &dir, &config);
+        eprintln!("kanshi on the old profile: {}", stderr.trim());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

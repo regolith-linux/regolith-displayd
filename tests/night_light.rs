@@ -2,13 +2,12 @@
 //! Mutter does in GNOME. These tests run the follower against a fake color
 //! plugin on a private bus.
 
-use regolith_displayd::gamma::Command;
 use regolith_displayd::night_light::{follow_gsd_color, NEUTRAL_TEMPERATURE};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::watch;
 use zbus::names::InterfaceName;
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 
@@ -93,24 +92,25 @@ async fn invalidate_temperature(plugin: &zbus::Connection, temperature: u32) {
 }
 
 /// Wait until the follower sends `expected`.
-fn expect(commands: &Receiver<Command>, expected: u32) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last = None;
-    tokio::task::block_in_place(|| loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match commands.recv_timeout(left) {
-            Ok(Command::Temperature(t)) if t == expected => return,
-            Ok(Command::Temperature(t)) => last = Some(t),
-            Ok(_) => {}
-            Err(_) => panic!("expected {expected} K, last sent {last:?}"),
+async fn expect(temperature: &mut watch::Receiver<u32>, expected: u32) {
+    let wait = async {
+        while *temperature.borrow_and_update() != expected {
+            temperature.changed().await.unwrap();
         }
-    })
+    };
+    if tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .is_err()
+    {
+        panic!("expected {expected} K, last sent {}", *temperature.borrow());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn follows_color_plugin_temperature() {
     let (_bus, address) = private_bus();
-    let (sink, commands) = mpsc::channel();
+    // Start from a value no step expects, so each step needs a send.
+    let (sink, mut temperature) = watch::channel(0);
     let follower_address = address.clone();
     tokio::spawn(async move {
         let connection = ConnectionBuilder::address(follower_address.as_str())
@@ -122,28 +122,28 @@ async fn follows_color_plugin_temperature() {
     });
 
     // No color plugin: neutral.
-    expect(&commands, NEUTRAL_TEMPERATURE);
+    expect(&mut temperature, NEUTRAL_TEMPERATURE).await;
 
     // The plugin starts with Night Light active.
     let plugin = start_color_plugin(&address, 3500).await;
-    expect(&commands, 3500);
+    expect(&mut temperature, 3500).await;
 
     // The schedule or the Settings slider changes the temperature.
-    for temperature in [3200, 2700, 6500, 4000] {
-        set_temperature(&plugin, temperature).await;
-        expect(&commands, temperature);
+    for kelvin in [3200, 2700, 6500, 4000] {
+        set_temperature(&plugin, kelvin).await;
+        expect(&mut temperature, kelvin).await;
     }
 
     // An invalidated property is read again.
     invalidate_temperature(&plugin, 3000).await;
-    expect(&commands, 3000);
+    expect(&mut temperature, 3000).await;
 
     // The plugin stops (its bus name goes away): back to neutral rather
     // than a stuck tint.
     plugin.release_name(NAME).await.unwrap();
-    expect(&commands, NEUTRAL_TEMPERATURE);
+    expect(&mut temperature, NEUTRAL_TEMPERATURE).await;
 
     // It comes back.
     let _plugin = start_color_plugin(&address, 2700).await;
-    expect(&commands, 2700);
+    expect(&mut temperature, 2700).await;
 }

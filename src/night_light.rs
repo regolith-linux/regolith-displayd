@@ -8,13 +8,13 @@
 //! configuration, follows that property and sets a matching gamma table on
 //! every output through wlr-gamma-control (see [`crate::gamma`]).
 //!
-//! Night Light runs on its own threads, so neither a missing color plugin
+//! Night Light runs on its own thread, so neither a missing color plugin
 //! nor a missing compositor can disturb the `DisplayConfig` service.
 
-use crate::gamma::{self, Command};
+use crate::gamma;
 use log::{debug, info, warn};
-use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
+use tokio::sync::watch;
 use zbus::export::futures_util::StreamExt;
 use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::names::InterfaceName;
@@ -123,12 +123,12 @@ async fn read_temperature(properties: &PropertiesProxy<'_>) -> Option<u32> {
 /// connection fails.
 pub async fn follow_gsd_color(
     connection: &zbus::Connection,
-    sink: &Sender<Command>,
+    sink: &watch::Sender<u32>,
 ) -> zbus::Result<()> {
     let send = |temperature: Option<u32>| {
         let temperature = temperature.unwrap_or(NEUTRAL_TEMPERATURE);
         debug!("Night Light temperature {temperature} K");
-        let _ = sink.send(Command::Temperature(temperature));
+        sink.send_replace(temperature);
     };
     // Subscribe before the first read so no change is missed.
     let dbus = DBusProxy::builder(connection)
@@ -186,22 +186,30 @@ pub async fn follow_gsd_color(
     }
 }
 
-/// Start Night Light: one thread applies gamma tables through the
-/// compositor, another follows the color plugin on the session bus. Both
-/// run for the lifetime of the daemon and never take it down.
-pub fn spawn() {
-    let (sink, commands) = mpsc::channel();
-    let events = sink.clone();
-    let spawned = std::thread::Builder::new()
-        .name("night-light-gamma".into())
-        .spawn(move || gamma::run(commands, events));
-    if let Err(e) = spawned {
-        warn!("Night Light is unavailable: cannot start its gamma thread: {e}");
-        return;
+/// Follow the color plugin for the lifetime of the daemon, reconnecting to
+/// the session bus when the connection fails.
+async fn follow_forever(sink: watch::Sender<u32>) {
+    loop {
+        let result = async {
+            let connection = zbus::Connection::session().await?;
+            follow_gsd_color(&connection, &sink).await
+        }
+        .await;
+        if let Err(e) = result {
+            warn!("Cannot follow the Night Light temperature: {e}");
+        }
+        sink.send_replace(NEUTRAL_TEMPERATURE);
+        tokio::time::sleep(RETRY_DELAY).await;
     }
+}
+
+/// Start Night Light on its own thread: it follows the color plugin on the
+/// session bus and applies its temperature through the compositor, for the
+/// lifetime of the daemon, and never takes the daemon down.
+pub fn spawn() {
     let spawned = std::thread::Builder::new()
-        .name("night-light-dbus".into())
-        .spawn(move || {
+        .name("night-light".into())
+        .spawn(|| {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -212,23 +220,13 @@ pub fn spawn() {
                     return;
                 }
             };
-            runtime.block_on(async move {
-                loop {
-                    let result = async {
-                        let connection = zbus::Connection::session().await?;
-                        follow_gsd_color(&connection, &sink).await
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        warn!("Cannot follow the Night Light temperature: {e}");
-                    }
-                    let _ = sink.send(Command::Temperature(NEUTRAL_TEMPERATURE));
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
+            let (sink, temperature) = watch::channel(NEUTRAL_TEMPERATURE);
+            runtime.block_on(async {
+                tokio::join!(gamma::run(temperature), follow_forever(sink));
             });
         });
     if let Err(e) = spawned {
-        warn!("Night Light is unavailable: cannot start its D-Bus thread: {e}");
+        warn!("Night Light is unavailable: cannot start its thread: {e}");
     }
 }
 

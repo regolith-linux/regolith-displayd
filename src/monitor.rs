@@ -112,6 +112,11 @@ impl Monitor {
         format!("{} {} {}", desc.1, desc.2, desc.3)
     }
 
+    /// The connector the monitor is plugged into (e.g. "DP-1").
+    pub fn connector(&self) -> &str {
+        &self.description.0
+    }
+
     /// How a kanshi profile names this monitor, given all the `connected`
     /// monitors: by its description ("make model serial"), which follows the
     /// monitor to any port, unless another connected monitor has the same

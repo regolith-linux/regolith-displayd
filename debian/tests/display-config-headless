@@ -1,0 +1,217 @@
+#!/bin/bash
+# Drive regolith-displayd over D-Bus the way the Displays panel does, on a
+# headless sway with a real kanshi: the headless output must report a mode,
+# verify must write nothing, an unsatisfiable Apply must fail without writing,
+# and an Apply must change the scale in sway, keep exactly one kanshi alive
+# (reloaded in place, or restarted when it cannot reload on SIGHUP) and leave
+# no zombie processes.
+set -euo pipefail
+
+work=$(mktemp -d)
+export HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+unset WAYLAND_DISPLAY SWAYSOCK DISPLAY DBUS_SESSION_BUS_ADDRESS
+profiles="$HOME/.config/regolith3/kanshi/profiles"
+pids=()
+
+cleanup() {
+    if [ -n "${displayd:-}" ]; then
+        pkill -P "$displayd" -x kanshi 2>/dev/null || true
+    fi
+    kill "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*"
+    for log in "$work"/*.log; do
+        echo "--- $log"
+        tail -n 40 "$log"
+    done
+    exit 1
+}
+
+# retry <tries, 0.5 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+dc() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method "org.gnome.Mutter.DisplayConfig.$1" "${@:2}"
+}
+
+# apply <method> <scale> <mode>
+apply() {
+    dc ApplyMonitorsConfig "$serial" "$1" \
+        "[(0, 0, $2, 0, false, [('HEADLESS-1', '$3', @a{sv} {})])]" "@a{sv} {}"
+}
+
+headless_output() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+out = next(o for o in json.load(sys.stdin) if o["name"] == "HEADLESS-1")
+mode = out["current_mode"]
+print(len(out["modes"]), out["scale"], "%dx%d@%gHz" % (mode["width"], mode["height"], mode["refresh"] / 1000))'
+}
+
+sway_scale_is() {
+    [ "$(headless_output | cut -d " " -f 2)" = "$1" ]
+}
+
+live_kanshis() {
+    ps -u "$(id -u)" -o stat=,comm= | awk '$2 == "kanshi" && $1 !~ /^Z/' | wc -l
+}
+
+live_kanshis_are() {
+    [ "$(live_kanshis)" = "$1" ]
+}
+
+# The kanshi this test runs: the one it started, or the one regolith-displayd
+# started in its place.
+our_kanshi() {
+    if ps -o stat= -p "$kanshi" | grep -qv '^Z'; then
+        echo "$kanshi"
+        return
+    fi
+    ps --ppid "$displayd" -o pid=,stat=,comm= | awk '$3 == "kanshi" && $2 !~ /^Z/ {print $1}'
+}
+
+catches_sighup() {
+    local mask
+    mask=$(awk '$1 == "SigCgt:" {print $2}' "/proc/$1/status")
+    [ -n "$mask" ] && (( 0x$mask & 1 ))
+}
+
+zombie_children() {
+    ps --ppid "$displayd" -o stat= | awk '/^Z/ {n++} END {print n + 0}'
+}
+
+profile_files() {
+    ls "$profiles"
+}
+
+printf 'xwayland disable\noutput HEADLESS-1 mode 1600x1000\n' > "$work/sway.cfg"
+sway -c "$work/sway.cfg" > "$work/sway.log" 2>&1 &
+pids+=($!)
+retry 60 compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" > /dev/null || fail "sway did not start"
+SWAYSOCK=$(compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" | head -n 1)
+export SWAYSOCK
+retry 20 swaymsg -t get_outputs > /dev/null || fail "sway IPC not ready"
+WAYLAND_DISPLAY=$(compgen -G "$XDG_RUNTIME_DIR/wayland-*" | grep -v '\.lock$' | head -n 1)
+WAYLAND_DISPLAY=${WAYLAND_DISPLAY##*/}
+[ -n "$WAYLAND_DISPLAY" ] || fail "sway created no wayland socket"
+export WAYLAND_DISPLAY
+
+dbus-daemon --session --nofork --print-address=1 > "$work/bus" 2> "$work/dbus.log" &
+pids+=($!)
+retry 20 test -s "$work/bus" || fail "dbus-daemon did not start"
+DBUS_SESSION_BUS_ADDRESS=$(head -n 1 "$work/bus")
+export DBUS_SESSION_BUS_ADDRESS
+
+# sway 1.7 with kanshi 1.2 (Ubuntu jammy) cannot apply any profile to a
+# headless output. Check that kanshi can before relying on the scale.
+printf 'profile {\n\toutput HEADLESS-1 scale 2\n}\n' > "$work/probe.cfg"
+kanshi -c "$work/probe.cfg" > "$work/probe.log" 2>&1 &
+probe=$!
+scale_checks=yes
+retry 20 sway_scale_is 2.0 || scale_checks=no
+kill "$probe"
+wait "$probe" 2> /dev/null || true
+swaymsg -q output HEADLESS-1 scale 1
+if [ "$scale_checks" = no ]; then
+    echo "note: kanshi cannot apply a profile to the headless output here, scale checks skipped: $(tr '\n' ' ' < "$work/probe.log")"
+fi
+
+regolith-displayd-init > /dev/null
+kanshi -c "$HOME/.config/regolith3/kanshi/config" > "$work/kanshi.log" 2>&1 &
+kanshi=$!
+pids+=("$kanshi")
+sleep 1
+kill -0 "$kanshi" || fail "kanshi did not start"
+kanshis=$(live_kanshis)
+if catches_sighup "$kanshi"; then
+    reloads=yes
+    echo "kanshi reloads on SIGHUP: Apply must reload it in place"
+else
+    reloads=no
+    echo "kanshi exits on SIGHUP: Apply must restart it"
+    if systemctl --user show-environment > /dev/null 2>&1; then
+        echo "SKIP: the restart would go through regolith-init-kanshi.service, outside this test session"
+        exit 77
+    fi
+fi
+
+RUST_LOG=info regolith-displayd > "$work/displayd.log" 2>&1 &
+displayd=$!
+pids+=("$displayd")
+retry 40 sh -c 'gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig --method org.gnome.Mutter.DisplayConfig.GetCurrentState | grep -q HEADLESS-1' \
+    || fail "regolith-displayd does not serve the headless output"
+
+read -r modes _ mode < <(headless_output)
+echo "sway reports $modes modes for HEADLESS-1, current mode $mode"
+state=$(dc GetCurrentState)
+serial=$(sed -E 's/^\(uint32 ([0-9]+),.*/\1/' <<< "$state")
+grep -qF "'$mode'" <<< "$state" || fail "GetCurrentState lists no mode for HEADLESS-1 (current mode $mode): $state"
+echo "ok: HEADLESS-1 reports its current mode $mode"
+
+before=$(profile_files)
+apply 0 2.0 "$mode" > /dev/null || fail "verify rejected the reported current mode"
+[ "$(profile_files)" = "$before" ] || fail "verify changed the kanshi profiles"
+echo "ok: verify accepts $mode and writes nothing"
+
+if apply 1 2.0 1x1@1Hz > /dev/null 2>&1; then fail "an Apply with an unknown mode succeeded"; fi
+[ "$(profile_files)" = "$before" ] || fail "a failed Apply wrote a kanshi profile"
+echo "ok: an Apply with an unknown mode fails and writes nothing"
+
+for scale in 2 1 2; do
+    previous=$(our_kanshi)
+    apply 1 "$scale.0" "$mode" > /dev/null || fail "Apply of scale $scale failed"
+    if [ "$scale_checks" = yes ]; then
+        retry 40 sway_scale_is "$scale.0" || fail "scale $scale did not take effect in sway"
+    fi
+    retry 20 live_kanshis_are "$kanshis" || fail "live kanshi count changed: $kanshis -> $(live_kanshis)"
+    current=$(our_kanshi)
+    [ -n "$current" ] || fail "no kanshi is running after the Apply"
+    if [ "$reloads" = yes ]; then
+        [ "$current" = "$previous" ] || fail "kanshi $previous was replaced by $current instead of reloaded"
+    else
+        [ "$current" != "$previous" ] || fail "kanshi $previous cannot reload but was not restarted"
+    fi
+    [ "$(zombie_children)" = 0 ] || fail "regolith-displayd left zombie children"
+    echo "ok: Apply of scale $scale$([ "$scale_checks" = yes ] && echo " took effect"), kanshi $previous -> $current, no zombies"
+done
+grep -qF "mode $mode " "$profiles"/* || fail "the profile does not name mode $mode"
+
+# With no kanshi running, Apply starts one. Without a systemd user manager this
+# is the direct-spawn fallback; with one, regolith-init-kanshi.service would
+# start a kanshi outside this test session, so skip it there.
+if ! systemctl --user show-environment > /dev/null 2>&1; then
+    old=$(our_kanshi)
+    kill "$old"
+    wait "$old" 2> /dev/null || true
+    retry 20 live_kanshis_are $((kanshis - 1)) || fail "kanshi $old did not stop"
+    apply 1 1.0 "$mode" > /dev/null || fail "Apply with no kanshi running failed"
+    if [ "$scale_checks" = yes ]; then
+        retry 40 sway_scale_is 1.0 || fail "scale 1 did not take effect with no kanshi running"
+    fi
+    spawned=$(ps --ppid "$displayd" -o pid=,stat=,comm= | awk '$3 == "kanshi" && $2 !~ /^Z/ {print $1}')
+    [ -n "$spawned" ] || fail "regolith-displayd did not start kanshi"
+    retry 20 live_kanshis_are "$kanshis" || fail "live kanshi count changed: $kanshis -> $(live_kanshis)"
+    [ "$(zombie_children)" = 0 ] || fail "regolith-displayd left zombie children"
+    echo "ok: with no kanshi running, Apply started kanshi $spawned$([ "$scale_checks" = yes ] && echo " and the scale took effect")"
+fi
+
+kill -0 "$displayd" || fail "regolith-displayd exited"
+echo "PASS"

@@ -79,7 +79,17 @@ pub struct MonitorApply {
 
 impl Monitor {
     pub fn new(output: &Output) -> Monitor {
-        let output_modes = output.modes.iter().map(|m| Modes::new(output, m)).collect();
+        let mut output_modes: Vec<Modes> =
+            output.modes.iter().map(|m| Modes::new(output, m)).collect();
+        // Headless and other virtual outputs have no fixed mode list in sway,
+        // but Mutter's DisplayConfig API requires every monitor to have at
+        // least one mode (gnome-control-center aborts otherwise). Report the
+        // current mode as the only one.
+        if output_modes.is_empty() {
+            if let Some(current) = &output.current_mode {
+                output_modes.push(Modes::new(output, current));
+            }
+        }
         let description = (
             output.name.clone(),   // connector
             output.make.clone(),   // vendor
@@ -309,5 +319,41 @@ impl MonitorApply {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(modes: &str) -> Output {
+        serde_json::from_str(&format!(
+            r#"{{"id": 3, "name": "HEADLESS-1", "make": "Unknown", "model": "Unknown",
+                "serial": "Unknown", "active": true, "dpms": true, "primary": false,
+                "scale": 1.0, "transform": "normal", "modes": {modes},
+                "current_mode": {{"width": 1600, "height": 1000, "refresh": 0}},
+                "rect": {{"x": 0, "y": 0, "width": 1600, "height": 1000}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn output_without_modes_reports_current_mode() {
+        let monitor = Monitor::new(&output("[]"));
+        assert_eq!(monitor.modes.len(), 1);
+        assert_eq!(monitor.modes[0].get_id(), "1600x1000@0Hz");
+        assert!(monitor.modes[0].current());
+        assert_eq!(monitor.get_current_mode(), "1600x1000@0Hz");
+    }
+
+    #[test]
+    fn output_with_modes_is_unchanged() {
+        let monitor = Monitor::new(&output(
+            r#"[{"width": 1920, "height": 1080, "refresh": 60000},
+                {"width": 1600, "height": 1000, "refresh": 0}]"#,
+        ));
+        let ids: Vec<&str> = monitor.modes.iter().map(|m| m.get_id()).collect();
+        assert_eq!(ids, ["1920x1080@60Hz", "1600x1000@0Hz"]);
+        assert_eq!(monitor.get_current_mode(), "1600x1000@0Hz");
     }
 }

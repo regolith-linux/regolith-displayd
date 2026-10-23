@@ -1,0 +1,240 @@
+#!/bin/bash
+# Disable, unplug and plug in outputs on a headless sway while
+# regolith-displayd runs: it must notice each change by itself and tell the
+# Displays panel (MonitorsChanged). After an unplug or a plug-in it must also
+# move the serial on, so a configuration made for the old outputs is refused,
+# even when it arrives before the change was noticed, and save the next Apply
+# as a profile for the outputs that are connected.
+set -euo pipefail
+
+work=$(mktemp -d)
+export HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+unset WAYLAND_DISPLAY SWAYSOCK DISPLAY DBUS_SESSION_BUS_ADDRESS
+profiles="$HOME/.config/regolith3/kanshi/profiles"
+pids=()
+
+cleanup() {
+    if [ -n "${displayd:-}" ]; then
+        pkill -P "$displayd" -x kanshi 2>/dev/null || true
+    fi
+    kill "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*"
+    for log in "$work"/*.log; do
+        echo "--- $log"
+        tail -n 40 "$log"
+    done
+    exit 1
+}
+
+# retry <tries, 0.5 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+dc() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method "org.gnome.Mutter.DisplayConfig.$1" "${@:2}"
+}
+
+serial() {
+    dc GetCurrentState | sed -E 's/^\(uint32 ([0-9]+),.*/\1/'
+}
+
+# The connectors regolith-displayd reports, sorted, space separated.
+reported() {
+    dc GetCurrentState | grep -oE "\('[A-Z]+-[0-9]+', '[^']*', '[^']*', '[^']*'\)" \
+        | sed -E "s/^\('([^']+)'.*/\1/" | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+reported_is() {
+    [ "$(reported)" = "$1" ]
+}
+
+# How often <connector> appears in the state: as a monitor, and again as a
+# logical monitor when it is enabled.
+appearances() {
+    dc GetCurrentState | grep -oF "('$1', " | wc -l
+}
+
+appears() {
+    [ "$(appearances "$1")" = "$2" ]
+}
+
+sway_outputs() {
+    swaymsg -t get_outputs | python3 -c 'import json, sys; print(" ".join(sorted(o["name"] for o in json.load(sys.stdin))))'
+}
+
+# sway_active_is <output> <True|False>
+sway_active_is() {
+    [ "$(swaymsg -t get_outputs | python3 -c 'import json, sys; print(next(o["active"] for o in json.load(sys.stdin) if o["name"] == sys.argv[1]))' "$1")" = "$2" ]
+}
+
+current_mode() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+out = next(o for o in json.load(sys.stdin) if o["name"] == sys.argv[1])
+mode = out["current_mode"]
+print("%dx%d@%gHz" % (mode["width"], mode["height"], mode["refresh"] / 1000))' "$1"
+}
+
+signals() {
+    grep -c 'MonitorsChanged' "$work/monitor.log" || true
+}
+
+signals_above() {
+    [ "$(signals)" -gt "$1" ]
+}
+
+live_kanshis() {
+    ps -u "$(id -u)" -o stat=,comm= | awk '$2 == "kanshi" && $1 !~ /^Z/' | wc -l
+}
+
+catches_sighup() {
+    local mask
+    mask=$(awk '$1 == "SigCgt:" {print $2}' "/proc/$1/status")
+    [ -n "$mask" ] && (( 0x$mask & 1 ))
+}
+
+printf 'xwayland disable\noutput HEADLESS-1 mode 1600x1000\n' > "$work/sway.cfg"
+sway -c "$work/sway.cfg" > "$work/sway.log" 2>&1 &
+pids+=($!)
+retry 60 compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" > /dev/null || fail "sway did not start"
+SWAYSOCK=$(compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" | head -n 1)
+export SWAYSOCK
+retry 20 swaymsg -t get_outputs > /dev/null || fail "sway IPC not ready"
+WAYLAND_DISPLAY=$(compgen -G "$XDG_RUNTIME_DIR/wayland-*" | grep -v '\.lock$' | head -n 1)
+WAYLAND_DISPLAY=${WAYLAND_DISPLAY##*/}
+[ -n "$WAYLAND_DISPLAY" ] || fail "sway created no wayland socket"
+export WAYLAND_DISPLAY
+
+swaymsg -q create_output || fail "sway cannot create a headless output"
+retry 20 sh -c '[ "$(swaymsg -t get_outputs | grep -c "\"name\": \"HEADLESS-")" = 2 ]' || fail "no second headless output"
+second=$(sway_outputs | tr ' ' '\n' | grep -v '^HEADLESS-1$')
+echo "sway outputs: $(sway_outputs)"
+
+dbus-daemon --session --nofork --print-address=1 > "$work/bus" 2> "$work/dbus.log" &
+pids+=($!)
+retry 20 test -s "$work/bus" || fail "dbus-daemon did not start"
+DBUS_SESSION_BUS_ADDRESS=$(head -n 1 "$work/bus")
+export DBUS_SESSION_BUS_ADDRESS
+
+regolith-displayd-init > /dev/null
+kanshi -c "$HOME/.config/regolith3/kanshi/config" > "$work/kanshi.log" 2>&1 &
+kanshi=$!
+pids+=("$kanshi")
+sleep 1
+kill -0 "$kanshi" || fail "kanshi did not start"
+if ! catches_sighup "$kanshi" && systemctl --user show-environment > /dev/null 2>&1; then
+    echo "SKIP: an Apply would restart kanshi through regolith-init-kanshi.service, outside this test session"
+    exit 77
+fi
+
+RUST_LOG=info regolith-displayd > "$work/displayd.log" 2>&1 &
+displayd=$!
+pids+=("$displayd")
+retry 40 reported_is "HEADLESS-1 $second" || fail "regolith-displayd does not report both outputs: '$(reported)'"
+echo "ok: regolith-displayd reports HEADLESS-1 $second"
+
+gdbus monitor --session --dest org.gnome.Mutter.DisplayConfig > "$work/monitor.log" 2>&1 &
+pids+=($!)
+sleep 1
+# Disable and enable: the monitor stays, its logical monitor goes and comes back.
+appears "$second" 2 || fail "$second appears $(appearances "$second") times in the state, not 2"
+before=$(signals)
+swaymsg -q output "$second" disable || true
+if retry 10 sway_active_is "$second" False; then
+    retry 20 appears "$second" 1 || fail "regolith-displayd still reports $second as enabled after it was disabled"
+    retry 20 signals_above "$before" || fail "no MonitorsChanged after disabling $second"
+    before=$(signals)
+    swaymsg -q output "$second" enable
+    retry 20 appears "$second" 2 || fail "regolith-displayd does not report $second as enabled again"
+    retry 20 signals_above "$before" || fail "no MonitorsChanged after enabling $second"
+    echo "ok: regolith-displayd noticed that $second was disabled and enabled again"
+else
+    # sway 1.7 (Ubuntu 22.04) cannot disable a headless output.
+    echo "note: sway cannot disable a headless output here, disable checks skipped"
+fi
+
+old_serial=$(serial)
+before=$(signals)
+
+# Unplug, and right away (before the next poll) apply the layout the panel
+# had for both outputs.
+mode=$(current_mode HEADLESS-1)
+second_mode=$(current_mode "$second")
+stale="[(0, 0, 1.0, 0, false, [('HEADLESS-1', '$mode', @a{sv} {})]), (1600, 0, 1.0, 0, false, [('$second', '$second_mode', @a{sv} {})])]"
+mkdir -p "$profiles"
+files=$(ls "$profiles")
+if ! swaymsg output "$second" unplug > "$work/unplug.log" 2>&1; then
+    # sway 1.7 (Ubuntu 22.04) has no "output unplug".
+    echo "note: sway cannot unplug a headless output here, unplug checks skipped: $(tr '\n' ' ' < "$work/unplug.log")"
+    unplugged=no
+else
+    unplugged=yes
+fi
+if [ "$unplugged" = yes ]; then
+if dc ApplyMonitorsConfig "$old_serial" 1 "$stale" "@a{sv} {}" > /dev/null 2>&1; then
+    fail "an Apply made for both outputs succeeded right after $second was unplugged"
+fi
+[ "$(ls "$profiles")" = "$files" ] || fail "an Apply made for both outputs wrote a profile after $second was unplugged"
+echo "ok: an Apply made for both outputs right after the unplug is refused and writes nothing"
+retry 20 sh -c '[ "$(swaymsg -t get_outputs | grep -c "\"name\": \"HEADLESS-")" = 1 ]' || fail "sway still has $second"
+retry 20 reported_is "HEADLESS-1" || fail "regolith-displayd still reports '$(reported)' after $second was unplugged"
+echo "ok: regolith-displayd noticed that $second was unplugged"
+retry 20 signals_above "$before" || fail "no MonitorsChanged after the unplug"
+echo "ok: MonitorsChanged was emitted"
+new_serial=$(serial)
+[ "$new_serial" != "$old_serial" ] || fail "the serial is still $old_serial after the unplug"
+echo "ok: the serial moved from $old_serial to $new_serial"
+
+config="[(0, 0, 2.0, 0, false, [('HEADLESS-1', '$mode', @a{sv} {})])]"
+if dc ApplyMonitorsConfig "$old_serial" 1 "$config" "@a{sv} {}" > /dev/null 2>&1; then
+    fail "an Apply with the serial from before the unplug succeeded"
+fi
+[ "$(ls "$profiles")" = "$files" ] || fail "a refused Apply wrote a kanshi profile"
+echo "ok: an Apply with the serial from before the unplug is refused and writes nothing"
+
+dc ApplyMonitorsConfig "$new_serial" 1 "$config" "@a{sv} {}" > /dev/null || fail "Apply after the unplug failed"
+profile=$(ls -t "$profiles" | grep -vx dummy | head -n 1)
+[ -n "$profile" ] || fail "the Apply wrote no profile"
+lines=$(grep -c '^[[:space:]]*output ' "$profiles/$profile" || true)
+[ "$lines" = 1 ] || fail "the profile after the unplug names $lines outputs, not 1: $(cat "$profiles/$profile")"
+case "$profile" in *__*) fail "the profile after the unplug is named for several monitors: $profile" ;; esac
+echo "ok: the Apply after the unplug saved a profile for HEADLESS-1 only ($profile)"
+fi
+
+# Plug in, once any Apply has taken effect.
+sleep 2
+old_serial=$(serial)
+before=$(signals)
+previous=$(sway_outputs)
+swaymsg -q create_output || fail "sway cannot create a headless output"
+retry 20 sh -c '[ "$(swaymsg -t get_outputs | grep -c "\"name\": \"HEADLESS-")" -gt "$(echo "$1" | wc -w)" ]' sh "$previous" \
+    || fail "sway created no new output"
+expected=$(sway_outputs)
+added=$(LC_ALL=C comm -13 <(tr ' ' '\n' <<< "$previous") <(tr ' ' '\n' <<< "$expected") | tr '\n' ' ' | sed 's/ $//')
+retry 20 reported_is "$expected" || fail "regolith-displayd reports '$(reported)' after $added was plugged in, not '$expected'"
+echo "ok: regolith-displayd noticed that $added was plugged in"
+retry 20 signals_above "$before" || fail "no MonitorsChanged after the plug-in"
+[ "$(serial)" != "$old_serial" ] || fail "the serial is still $old_serial after the plug-in"
+echo "ok: MonitorsChanged was emitted and the serial moved on"
+
+[ "$(live_kanshis)" -ge 1 ] || fail "no kanshi is running"
+kill -0 "$displayd" || fail "regolith-displayd exited"
+echo "PASS"

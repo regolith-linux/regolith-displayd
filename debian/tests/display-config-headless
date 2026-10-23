@@ -232,6 +232,8 @@ print("%dx%d@%gHz" % (mode["width"], mode["height"], mode["refresh"] / 1000))' "
 retry 20 sh -c "gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig --method org.gnome.Mutter.DisplayConfig.GetCurrentState | grep -q \"'$second'\"" \
     || fail "regolith-displayd does not list $second"
 echo "outputs HEADLESS-1 and $second both report \"$desc\""
+# A plugged-in output moves the serial on.
+serial=$(dc GetCurrentState | sed -E 's/^\(uint32 ([0-9]+),.*/\1/')
 
 # HEADLESS-1 at scale 2 (800x500 logical), $second below it, where sway would
 # not put it by itself.

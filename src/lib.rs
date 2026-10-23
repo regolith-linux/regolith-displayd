@@ -7,6 +7,7 @@ use log::{debug, error, info, warn};
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::process::Command;
@@ -18,7 +19,7 @@ use std::{
     thread,
     time::Duration,
 };
-use swayipc_async::Connection;
+use swayipc_async::{Connection, Output};
 use tokio::sync::Mutex;
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 use zvariant::{DeserializeDict, SerializeDict, Type};
@@ -83,6 +84,20 @@ impl DisplayServer {
     ) -> zbus::fdo::Result<()> {
         debug!("Configuration Method: {method}");
         let mut manager_obj = self.manager.lock().await;
+        // Monitors plugged in or unplugged since the watcher last looked:
+        // the configuration was made for other monitors, so refuse it rather
+        // than save it as their profile. The watcher reports the change,
+        // moving the serial on, and the panel reads the new state.
+        match manager_obj.get_monitor_info(&self.sway_connection).await {
+            Ok((monitors, _)) if !same_monitors(&manager_obj.monitors, &monitors) => {
+                error!("Invalid configuration recieved for method apply_monitors_config: the monitors changed");
+                return Err(zbus::fdo::Error::InvalidArgs(String::from(
+                    "The monitors changed",
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => error!("Error getting output information from sway: {e}"),
+        }
         debug!("Serial: {} {}", manager_obj.serial, serial);
         if serial != manager_obj.serial {
             error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
@@ -189,31 +204,27 @@ impl DisplayManager {
         }
     }
 
+    /// Follow sway's outputs: every 700 ms, store them if they changed (see
+    /// [`DisplayManager::update`]), tell the Displays panel, and hold back or
+    /// restore the profiles kept to particular monitors.
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut prev_monitor_set = HashSet::new();
-        let mut prev_logical_monitor_set = HashSet::new();
         loop {
-            thread::sleep(Duration::from_millis(700));
             let mut manager_obj_lock = manager_obj.lock().await;
             let display_info = manager_obj_lock
                 .get_monitor_info(&sway_connection)
                 .await
                 .unwrap();
-            let monitor_set: HashSet<Monitor> = display_info.0.iter().cloned().collect();
-            let logical_monitor_set: HashSet<LogicalMonitor> =
-                display_info.1.iter().cloned().collect();
             // A monitor that went away is a change too.
-            if monitor_set != prev_monitor_set || logical_monitor_set != prev_logical_monitor_set {
-                prev_monitor_set = monitor_set;
-                prev_logical_monitor_set = logical_monitor_set;
-                manager_obj_lock.monitors = display_info.0.clone();
-                manager_obj_lock.logical_monitors = display_info.1.clone();
+            let changed = manager_obj_lock.update(display_info.0.clone(), display_info.1.clone());
+            if changed {
                 debug!("monitors info: {:#?}", manager_obj_lock.monitors);
                 debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
-                drop(manager_obj_lock);
+            }
+            drop(manager_obj_lock);
+            if changed {
                 Self::emit_monitors_changed().await?;
                 let kanshi_paths = get_kanshi_paths().await?;
                 if hold_profiles_for_other_monitors(
@@ -225,6 +236,7 @@ impl DisplayManager {
                     }
                 }
             }
+            tokio::time::sleep(Duration::from_millis(700)).await;
         }
     }
 
@@ -335,14 +347,55 @@ impl DisplayManager {
         sway_connection: &Mutex<Connection>,
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
+        Ok(Self::monitors_of(&outputs))
+    }
+
+    /// The monitors of sway's `outputs`, and the logical monitors of the
+    /// active ones.
+    fn monitors_of(outputs: &[Output]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
         let monitors = outputs.iter().map(|o| Monitor::new(o)).collect();
         let logical_monitors = outputs
             .iter()
             .filter(|o| o.active)
             .map(|o| LogicalMonitor::new(o))
             .collect();
-        Ok((monitors, logical_monitors))
+        (monitors, logical_monitors)
     }
+
+    /// Store `monitors` and `logical_monitors` if they differ from the current
+    /// state, as sets: a monitor that was added, removed or changed mode, or a
+    /// logical monitor that was added, removed, moved, scaled or rotated.
+    /// Returns whether they did.
+    ///
+    /// When monitors were plugged in or unplugged, the serial also moves on,
+    /// so a configuration composed for the previous monitors is refused
+    /// instead of being saved as their profile. (Mutter moves it on every
+    /// change; a new layout or mode keeps it here, so a client may still
+    /// apply several layouts in a row with one serial.)
+    fn update(&mut self, monitors: Vec<Monitor>, logical_monitors: Vec<LogicalMonitor>) -> bool {
+        if same_set(&self.monitors, &monitors)
+            && same_set(&self.logical_monitors, &logical_monitors)
+        {
+            return false;
+        }
+        if !same_monitors(&self.monitors, &monitors) {
+            self.serial = self.serial.wrapping_add(1);
+        }
+        self.monitors = monitors;
+        self.logical_monitors = logical_monitors;
+        true
+    }
+}
+
+/// Whether `a` and `b` hold the same elements, in any order.
+fn same_set<T: Eq + Hash>(a: &[T], b: &[T]) -> bool {
+    a.iter().collect::<HashSet<_>>() == b.iter().collect::<HashSet<_>>()
+}
+
+/// Whether `a` and `b` are the same monitors (connector, vendor, product and
+/// serial), whatever their modes.
+fn same_monitors(a: &[Monitor], b: &[Monitor]) -> bool {
+    a.len() == b.len() && a.iter().all(|monitor| b.contains(monitor))
 }
 
 impl DisplayManagerProperties {
@@ -1275,5 +1328,124 @@ mod tests {
         assert!(!calls().contains("killall"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::*;
+
+    /// A sway output named `connector`, active at `x` with `scale`, in mode
+    /// `width`x1080.
+    fn sway_output(connector: &str, x: i32, scale: f64, width: i32) -> Output {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "name": connector, "make": "Acme", "model": connector, "serial": "0",
+            "active": true, "dpms": true, "primary": false, "scale": scale, "transform": "normal",
+            "modes": [
+                {"width": 1920, "height": 1080, "refresh": 60000},
+                {"width": 1280, "height": 1080, "refresh": 60000}
+            ],
+            "current_mode": {"width": width, "height": 1080, "refresh": 60000},
+            "rect": {"x": x, "y": 0, "width": width, "height": 1080}
+        }))
+        .unwrap()
+    }
+
+    fn state(outputs: &[Output]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
+        DisplayManager::monitors_of(outputs)
+    }
+
+    /// A manager that has reported `outputs`, at serial 1.
+    fn reported(outputs: &[Output]) -> DisplayManager {
+        let mut manager = DisplayManager {
+            serial: 0,
+            monitors: Vec::new(),
+            logical_monitors: Vec::new(),
+            properties: DisplayManagerProperties::new(),
+        };
+        let (monitors, logical_monitors) = state(outputs);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(manager.serial, 1);
+        manager
+    }
+
+    /// The models of the monitors, which [`sway_output`] names after the
+    /// connector.
+    fn connectors(manager: &DisplayManager) -> Vec<String> {
+        manager
+            .monitors
+            .iter()
+            .map(|m| m.get_dpy_name().split(' ').nth(1).unwrap().to_string())
+            .collect()
+    }
+
+    fn dp1() -> Output {
+        sway_output("DP-1", 0, 1.0, 1920)
+    }
+
+    fn dp2() -> Output {
+        sway_output("DP-2", 1920, 1.0, 1920)
+    }
+
+    #[test]
+    fn an_unplugged_monitor_is_noticed() {
+        let mut manager = reported(&[dp1(), dp2()]);
+        let (monitors, logical_monitors) = state(&[dp1()]);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(connectors(&manager), ["DP-1"]);
+        assert_eq!(manager.logical_monitors.len(), 1);
+        assert_eq!(manager.serial, 2);
+    }
+
+    #[test]
+    fn a_plugged_in_monitor_is_noticed() {
+        let mut manager = reported(&[dp1()]);
+        let (monitors, logical_monitors) = state(&[dp1(), dp2()]);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(connectors(&manager), ["DP-1", "DP-2"]);
+        assert_eq!(manager.serial, 2);
+    }
+
+    #[test]
+    fn an_unplugged_disabled_monitor_is_noticed() {
+        // A disabled output has a monitor but no logical monitor, so only the
+        // monitors tell its removal apart.
+        let disabled_dp2 = || {
+            let mut output = dp2();
+            output.active = false;
+            output
+        };
+        let mut manager = reported(&[dp1(), disabled_dp2()]);
+        assert_eq!(manager.logical_monitors.len(), 1);
+        let (monitors, logical_monitors) = state(&[dp1(), disabled_dp2()]);
+        assert_eq!(logical_monitors.len(), 1);
+        assert!(!manager.update(monitors, logical_monitors));
+        let (monitors, logical_monitors) = state(&[dp1()]);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(connectors(&manager), ["DP-1"]);
+        assert_eq!(manager.serial, 2);
+    }
+
+    #[test]
+    fn the_same_outputs_in_another_order_are_no_change() {
+        let mut manager = reported(&[dp1(), dp2()]);
+        let (monitors, logical_monitors) = state(&[dp2(), dp1()]);
+        assert!(!manager.update(monitors, logical_monitors));
+        assert_eq!(manager.serial, 1);
+    }
+
+    #[test]
+    fn a_new_layout_or_mode_is_a_change() {
+        let mut manager = reported(&[dp1(), dp2()]);
+        for changed in [
+            sway_output("DP-2", 0, 1.0, 1920),    // moved
+            sway_output("DP-2", 1920, 2.0, 1920), // scaled
+            sway_output("DP-2", 1920, 2.0, 1280), // another mode
+        ] {
+            let (monitors, logical_monitors) = state(&[dp1(), changed]);
+            assert!(manager.update(monitors, logical_monitors));
+            // The same monitors: a configuration for them is still valid.
+            assert_eq!(manager.serial, 1);
+        }
     }
 }

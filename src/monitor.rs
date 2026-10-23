@@ -112,6 +112,29 @@ impl Monitor {
         format!("{} {} {}", desc.1, desc.2, desc.3)
     }
 
+    /// The connector the monitor is plugged into (e.g. "DP-1").
+    pub fn connector(&self) -> &str {
+        &self.description.0
+    }
+
+    /// How a kanshi profile names this monitor, given all the `connected`
+    /// monitors: by its description ("make model serial"), which follows the
+    /// monitor to any port, unless another connected monitor has the same
+    /// description. Then by its connector name (e.g. "DP-1"), because kanshi
+    /// rejects the whole configuration when a profile names an output twice.
+    pub fn kanshi_name(&self, connected: &[Monitor]) -> String {
+        let description = self.get_dpy_name();
+        let same = connected
+            .iter()
+            .filter(|monitor| monitor.get_dpy_name() == description)
+            .count();
+        if same > 1 {
+            self.description.0.clone()
+        } else {
+            description
+        }
+    }
+
     pub fn get_current_mode(&self) -> &str {
         match self.modes.iter().find(|&mode| mode.current()) {
             Some(m) => m.get_modestr(),
@@ -270,8 +293,8 @@ impl MonitorApply {
             .find(|mon| mon.monitors[0].0 == self.monitors[0].0)
     }
 
-    pub fn save_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) {
-        let dpy_name = monitor.get_dpy_name();
+    pub fn save_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor, connected: &[Monitor]) {
+        let dpy_name = monitor.kanshi_name(connected);
         let mode = match self.get_modestr(&monitor) {
             Some(x) => x,
             _ => return,

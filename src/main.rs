@@ -1,5 +1,5 @@
 use log::error;
-use regolith_displayd::{DisplayManager, DisplayServer};
+use regolith_displayd::{night_light, DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc};
 use swayipc_async::Connection as SwayConection;
 use tokio::{sync::Mutex, try_join};
@@ -17,6 +17,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let server =
         DisplayServer::new(Arc::clone(&manager_ref), Arc::clone(&sway_connection_ref)).await;
     server.run_server().await.unwrap();
+
+    // Apply the color plugin's Night Light temperature, as Mutter does.
+    night_light::spawn();
 
     let watch_handle = tokio::spawn(async move {
         DisplayManager::watch_changes(manager_ref, sway_connection_ref)

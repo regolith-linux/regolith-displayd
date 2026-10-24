@@ -1,5 +1,6 @@
 pub mod confirm;
 pub mod edid;
+pub mod labels;
 pub mod modes;
 pub mod monitor;
 
@@ -324,6 +325,9 @@ impl DisplayServer {
             ConnectionBuilder::session()?
                 .name("org.gnome.Mutter.DisplayConfig")?
                 .serve_at("/org/gnome/Mutter/DisplayConfig", self)?
+                // The Displays panel's monitor labels, which regolith-powerd
+                // passes on from org.gnome.Shell.
+                .serve_at(labels::PATH, labels::MonitorLabels::new())?
                 .build()
                 .await?,
         );

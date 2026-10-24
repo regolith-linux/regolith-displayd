@@ -1,3 +1,11 @@
 Tests: display-config-headless
 Depends: @, dbus, kanshi, libglib2.0-bin, procps, python3, sway
 Restrictions: allow-stderr, skippable
+
+Tests: monitor-labels-headless
+Depends: @, dbus, grim, libglib2.0-bin, python3, python3-gi, sway
+Restrictions: allow-stderr, skippable
+
+Tests: monitor-labels-powerd
+Depends: @, dbus, gnome-settings-daemon-common, grim, gsettings-desktop-schemas, libglib2.0-bin, python3, python3-gi, sway
+Restrictions: allow-stderr, skippable

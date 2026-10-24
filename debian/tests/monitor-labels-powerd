@@ -1,0 +1,89 @@
+#!/bin/bash
+# The Displays panel's monitor labels in the sway session, end to end: the
+# panel calls org.gnome.Shell, which regolith-powerd owns there, and powerd
+# passes the calls on to regolith-displayd, which draws the labels. Only the
+# client that showed the labels can hide them or show others; they go when
+# that client, or powerd, leaves the bus; and the panel still gets answers
+# while displayd is not running. Skipped unless a regolith-powerd that passes
+# the labels on is installed.
+set -euo pipefail
+. "$(dirname "$0")/monitor-labels-lib.sh"
+
+SHELL_NAME=org.gnome.Shell
+
+command -v regolith-powerd > /dev/null || { echo "SKIP: regolith-powerd is not installed"; exit 77; }
+
+# start_powerd: sets $powerd.
+start_powerd() {
+    GSETTINGS_BACKEND=memory regolith-powerd >> "$work/powerd.log" 2>&1 &
+    powerd=$!
+    pids+=("$powerd")
+    retry 40 owner "$SHELL_NAME" || fail "regolith-powerd does not own $SHELL_NAME"
+}
+
+start_sway
+start_bus
+start_displayd
+start_powerd
+if ! gdbus introspect --session --dest "$SHELL_NAME" --object-path /org/gnome/Shell | grep -q ShowMonitorLabels; then
+    echo "SKIP: this regolith-powerd does not pass the monitor labels on"
+    exit 77
+fi
+gdbus introspect --session --dest "$SHELL_NAME" --object-path /org/gnome/SessionManager/EndSessionDialog \
+    | grep -q "interface org.gnome.SessionManager.EndSessionDialog" \
+    || fail "regolith-powerd no longer serves the end-session dialog"
+echo "ok: regolith-powerd owns $SHELL_NAME, with the monitor labels and the end-session dialog"
+
+panel=("$SHELL_NAME" /org/gnome/Shell "$SHELL_NAME")
+client_start "${panel[@]}"
+client show HEADLESS-1=1 HEADLESS-2=2
+retry 20 has_label HEADLESS-1 || fail "no label on HEADLESS-1"
+retry 20 has_label HEADLESS-2 || fail "no label on HEADLESS-2"
+one_shape=$(shape HEADLESS-1)
+[ "$one_shape" != "$(shape HEADLESS-2)" ] || fail "the labels of HEADLESS-1 and HEADLESS-2 look the same"
+echo "ok: the panel's labels are shown"
+
+another "${panel[@]}"
+sleep 1
+[ "$(shape HEADLESS-1)" = "$one_shape" ] || fail "another client changed the labels"
+has_label HEADLESS-2 || fail "another client hid the labels"
+echo "ok: another client can neither hide nor change the labels"
+
+client hide
+retry 20 has_no_label HEADLESS-1 || fail "the label of HEADLESS-1 is still shown after HideMonitorLabels"
+retry 20 has_no_label HEADLESS-2 || fail "the label of HEADLESS-2 is still shown after HideMonitorLabels"
+echo "ok: HideMonitorLabels removes the labels"
+
+client show HEADLESS-2=1
+retry 20 has_label HEADLESS-2 || fail "no label on HEADLESS-2"
+has_no_label HEADLESS-1 || fail "a label on HEADLESS-1, which was not asked for"
+client_stop
+retry 20 has_no_label HEADLESS-2 || fail "the label stayed after the panel left the bus"
+echo "ok: the labels go when the panel leaves the bus"
+
+client_start "${panel[@]}"
+client show HEADLESS-1=1
+retry 20 has_label HEADLESS-1 || fail "no label on HEADLESS-1"
+kill "$powerd"
+wait "$powerd" 2>/dev/null || true
+retry 20 has_no_label HEADLESS-1 || fail "the label stayed after regolith-powerd left the bus"
+echo "ok: the labels go when regolith-powerd leaves the bus"
+
+start_powerd
+kill "$displayd"
+wait "$displayd" 2>/dev/null || true
+client show HEADLESS-1=1
+client hide
+kill -0 "$powerd" || fail "regolith-powerd exited"
+echo "ok: without regolith-displayd the panel still gets answers"
+
+start_displayd
+client show HEADLESS-1=1
+retry 20 has_label HEADLESS-1 || fail "no label on HEADLESS-1 once regolith-displayd is back"
+client hide
+retry 20 has_no_label HEADLESS-1 || fail "the label of HEADLESS-1 is still shown after HideMonitorLabels"
+echo "ok: the labels work again once regolith-displayd is back"
+
+kill -0 "$powerd" || fail "regolith-powerd exited"
+kill -0 "$displayd" || fail "regolith-displayd exited"
+echo "PASS"

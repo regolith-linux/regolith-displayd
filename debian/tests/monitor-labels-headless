@@ -1,0 +1,56 @@
+#!/bin/bash
+# The Displays panel's monitor labels on a headless sway: regolith-displayd
+# serves ShowMonitorLabels and HideMonitorLabels on its own bus name (the
+# methods regolith-powerd passes on from org.gnome.Shell), draws each number
+# in the top left corner of its output, lets only the client that showed the
+# labels hide them or show others, and hides them when that client leaves.
+# It does not own org.gnome.Shell.
+set -euo pipefail
+. "$(dirname "$0")/monitor-labels-lib.sh"
+
+start_sway
+start_bus
+start_displayd
+gdbus introspect --session --dest "$DISPLAYD" --object-path "$LABELS_OBJECT" | grep -q "interface $LABELS_IFACE" \
+    || fail "regolith-displayd has no $LABELS_IFACE at $LABELS_OBJECT"
+! owner org.gnome.Shell || fail "regolith-displayd owns org.gnome.Shell, which regolith-powerd owns in the session"
+echo "ok: regolith-displayd serves $LABELS_IFACE at $LABELS_OBJECT and does not own org.gnome.Shell"
+
+client_start "$DISPLAYD" "$LABELS_OBJECT" "$LABELS_IFACE"
+client show HEADLESS-1=1 HEADLESS-2=2
+retry 20 has_label HEADLESS-1 || fail "no label on HEADLESS-1"
+retry 20 has_label HEADLESS-2 || fail "no label on HEADLESS-2"
+read -r one one_shape one_height < <(label HEADLESS-1)
+read -r two two_shape two_height < <(label HEADLESS-2)
+[ "$one_shape" != "$two_shape" ] || fail "the labels of HEADLESS-1 and HEADLESS-2 look the same"
+# The digits are as tall at scale 1 and 2 in logical pixels, so twice as
+# many pixels tall at scale 2.
+(( two_height * 10 >= one_height * 18 && two_height * 10 <= one_height * 22 )) \
+    || fail "the digit on HEADLESS-2 (scale 2) is $two_height pixels tall, on HEADLESS-1 $one_height"
+echo "ok: labels shown: 1 on HEADLESS-1 ($one white pixels, $one_height tall), 2 on HEADLESS-2 at scale 2 ($two, $two_height tall)"
+for output in HEADLESS-1 HEADLESS-2; do
+    grim -o "$output" "${AUTOPKGTEST_ARTIFACTS:-$work}/labels-$output.png" 2> /dev/null || true
+done
+
+another "$DISPLAYD" "$LABELS_OBJECT" "$LABELS_IFACE"
+sleep 1
+[ "$(shape HEADLESS-1)" = "$one_shape" ] || fail "another client changed the labels"
+has_label HEADLESS-2 || fail "another client hid the labels"
+echo "ok: another client can neither hide nor change the labels"
+
+client hide
+retry 20 has_no_label HEADLESS-1 || fail "the label of HEADLESS-1 is still shown after HideMonitorLabels"
+retry 20 has_no_label HEADLESS-2 || fail "the label of HEADLESS-2 is still shown after HideMonitorLabels"
+echo "ok: HideMonitorLabels removes the labels"
+
+client show HEADLESS-2=1
+retry 20 has_label HEADLESS-2 || fail "no label on HEADLESS-2"
+has_no_label HEADLESS-1 || fail "a label on HEADLESS-1, which was not asked for"
+echo "ok: only the outputs asked for get a label"
+
+client_stop
+retry 20 has_no_label HEADLESS-2 || fail "the label stayed after its client left the bus"
+echo "ok: the labels go when their client leaves the bus"
+
+kill -0 "$displayd" || fail "regolith-displayd exited"
+echo "PASS"

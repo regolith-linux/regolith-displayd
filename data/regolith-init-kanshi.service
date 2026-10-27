@@ -4,10 +4,14 @@ PartOf=graphical-session.target
 Wants=gnome-session.target
 After=gnome-session.target
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/kanshi -c %h/.config/regolith3/kanshi/config
-Restart=on-failure
 StartLimitIntervalSec=10
 StartLimitBurst=5
 
+[Service]
+Type=simple
+ExecStart=/usr/bin/kanshi -c %h/.config/regolith3/kanshi/config
+# kanshi re-reads its configuration and re-applies the matching profile on
+# SIGHUP. Older versions exit on SIGHUP instead and are started again.
+ExecReload=/bin/kill -HUP $MAINPID
+RestartForceExitStatus=SIGHUP
+Restart=on-failure

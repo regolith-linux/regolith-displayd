@@ -539,6 +539,19 @@ mod tests {
             .count()
     }
 
+    /// Wait until `pid` is listed as a live kanshi. spawn() returns once the
+    /// child has started exec, but the kernel gives it its new name a moment
+    /// later; until then it is not found by name.
+    fn wait_until_live(uid: u32, pid: u32) {
+        for _ in 0..100 {
+            if live_kanshi_pids(uid).contains(&pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("kanshi {pid} was not seen running");
+    }
+
     fn fake_tool(dir: &Path, name: &str, body: &str) {
         let path = dir.join(name);
         fs::write(
@@ -641,6 +654,7 @@ mod tests {
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "0");
         let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
+        wait_until_live(uid, exiting.id());
         assert!(!reloads_on_sighup(exiting.id()));
         assert_eq!(
             reload_or_start_kanshi(&config).unwrap(),
@@ -660,6 +674,7 @@ mod tests {
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "1");
         let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
+        wait_until_live(uid, exiting.id());
         assert_eq!(
             reload_or_start_kanshi(&config).unwrap(),
             KanshiReload::Spawned

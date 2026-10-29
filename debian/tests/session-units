@@ -1,0 +1,174 @@
+#!/bin/bash
+# The sway session reloads or restarts regolith-init-kanshi.service on every
+# `swaymsg reload`. Check, with the installed user units in a real systemd user
+# manager, that:
+# - starting regolith-init-displayd.service starts kanshi after displayd has
+#   created the kanshi configuration;
+# - reloading kanshi signals it in place, ten times in a row, without starting
+#   it again or touching displayd;
+# - restarting or stopping kanshi leaves displayd running;
+# - a kanshi that exits on SIGHUP (before 1.3) is started again on reload.
+# There is no compositor here, so kanshi and regolith-displayd are replaced by
+# stand-ins: only the units are under test.
+set -euo pipefail
+
+if [ ! -d /run/systemd/system ]; then
+    echo "systemd is not the init system here, no user manager can run"
+    exit 77
+fi
+
+user=regolith-units-test
+units=(regolith-init-displayd.service regolith-init-kanshi.service)
+
+cleanup() {
+    if [ -n "${uid:-}" ]; then
+        systemctl stop "user@$uid.service" || true
+    fi
+    if id "$user" > /dev/null 2>&1; then
+        userdel -r "$user" 2> /dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+useradd -m "$user"
+uid=$(id -u "$user")
+home=$(getent passwd "$user" | cut -d : -f 6)
+systemctl start "user@$uid.service"
+
+as_user() {
+    runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" "$@"
+}
+
+sc() {
+    as_user systemctl --user "$@"
+}
+
+fail() {
+    echo "FAIL: $*"
+    sc --no-pager status "${units[@]}" || true
+    journalctl --no-pager _UID="$uid" -n 40 || true
+    echo "--- kanshi log"
+    cat "$home/kanshi.log" || true
+    exit 1
+}
+
+# retry <tries, 0.2 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.2
+    done
+    return 1
+}
+
+main_pid() {
+    sc show -p MainPID --value "$1"
+}
+
+active() {
+    [ "$(sc is-active "$1")" = active ]
+}
+
+pid_changed() {
+    local pid
+    pid=$(main_pid "$1")
+    [ "$pid" != 0 ] && [ "$pid" != "$2" ]
+}
+
+reloads_logged() {
+    [ "$(grep -c "^hup $1\$" "$home/kanshi.log")" = "$2" ]
+}
+
+# gnome-session.target is wanted by both units; keep it out of this test.
+sc --quiet mask gnome-session.target
+
+as_user mkdir -p "$home/.config/systemd/user/regolith-init-displayd.service.d" \
+    "$home/.config/systemd/user/regolith-init-kanshi.service.d"
+
+# Stand-in for kanshi 1.3 and later: logs its start, whether the configuration
+# existed by then, and each SIGHUP, after which it keeps running.
+as_user tee "$home/kanshi" > /dev/null << 'EOF'
+#!/bin/sh
+if [ -f "$HOME/.config/regolith3/kanshi/config" ]; then
+    echo "start $$ config" >> "$HOME/kanshi.log"
+else
+    echo "start $$ no-config" >> "$HOME/kanshi.log"
+fi
+trap 'echo "hup $$" >> "$HOME/kanshi.log"' HUP
+trap 'exit 0' TERM
+while :; do
+    sleep 1 &
+    wait $!
+done
+EOF
+chmod +x "$home/kanshi"
+
+as_user tee "$home/.config/systemd/user/regolith-init-kanshi.service.d/stand-in.conf" > /dev/null << EOF
+[Service]
+ExecStart=
+ExecStart=$home/kanshi
+EOF
+# regolith-displayd-init still runs: it creates the kanshi configuration.
+as_user tee "$home/.config/systemd/user/regolith-init-displayd.service.d/stand-in.conf" > /dev/null << 'EOF'
+[Service]
+Type=simple
+ExecStart=
+ExecStart=/bin/sleep infinity
+EOF
+sc daemon-reload
+
+echo "start regolith-init-displayd.service"
+sc start regolith-init-displayd.service || fail "regolith-init-displayd.service did not start"
+retry 50 active regolith-init-kanshi.service || fail "starting displayd did not start kanshi"
+displayd=$(main_pid regolith-init-displayd.service)
+kanshi=$(main_pid regolith-init-kanshi.service)
+retry 50 grep -q "^start $kanshi " "$home/kanshi.log" || fail "kanshi stand-in did not log its start"
+grep -q "^start $kanshi config\$" "$home/kanshi.log" \
+    || fail "kanshi started before regolith-displayd-init created its configuration"
+
+echo "reload kanshi ten times"
+for _ in $(seq 10); do
+    sc reload-or-restart regolith-init-kanshi.service || fail "reloading kanshi failed"
+    sleep 0.1
+done
+retry 50 reloads_logged "$kanshi" 10 || fail "kanshi got $(grep -c "^hup $kanshi\$" "$home/kanshi.log") of 10 SIGHUPs"
+active regolith-init-kanshi.service || fail "kanshi is not running after the reloads"
+[ "$(main_pid regolith-init-kanshi.service)" = "$kanshi" ] || fail "reloading kanshi started a new kanshi"
+[ "$(grep -c '^start ' "$home/kanshi.log")" = 1 ] || fail "reloading kanshi started it again"
+[ "$(main_pid regolith-init-displayd.service)" = "$displayd" ] || fail "reloading kanshi restarted displayd"
+
+echo "restart kanshi three times"
+for _ in $(seq 3); do
+    sc restart regolith-init-kanshi.service || fail "restarting kanshi failed"
+done
+active regolith-init-kanshi.service || fail "kanshi is not running after the restarts"
+active regolith-init-displayd.service || fail "restarting kanshi stopped displayd"
+[ "$(main_pid regolith-init-displayd.service)" = "$displayd" ] || fail "restarting kanshi restarted displayd"
+
+echo "stop kanshi"
+sc stop regolith-init-kanshi.service
+active regolith-init-displayd.service || fail "stopping kanshi stopped displayd"
+[ "$(main_pid regolith-init-displayd.service)" = "$displayd" ] || fail "stopping kanshi restarted displayd"
+
+echo "reload a kanshi that exits on SIGHUP"
+as_user tee "$home/.config/systemd/user/regolith-init-kanshi.service.d/stand-in.conf" > /dev/null << 'EOF'
+[Service]
+ExecStart=
+ExecStart=/bin/sleep infinity
+EOF
+sc daemon-reload
+sc reset-failed regolith-init-kanshi.service 2> /dev/null || true
+sc start regolith-init-kanshi.service || fail "the old kanshi stand-in did not start"
+old=$(main_pid regolith-init-kanshi.service)
+# The reload itself may be reported as failed, when systemd sees the main
+# process die before the reload command returns; what matters is that kanshi
+# is started again.
+sc reload-or-restart regolith-init-kanshi.service || true
+retry 50 pid_changed regolith-init-kanshi.service "$old" || fail "a kanshi that exited on SIGHUP was not started again"
+retry 50 active regolith-init-kanshi.service || fail "kanshi is not running after it exited on SIGHUP"
+[ "$(main_pid regolith-init-displayd.service)" = "$displayd" ] || fail "the old kanshi's restart restarted displayd"
+
+sc stop "${units[@]}"
+echo "PASS"

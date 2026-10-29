@@ -1,3 +1,7 @@
 Tests: display-config-headless
 Depends: @, dbus, kanshi, libglib2.0-bin, procps, python3, sway
 Restrictions: allow-stderr, skippable
+
+Tests: session-units
+Depends: @, passwd, procps
+Restrictions: needs-root, allow-stderr, skippable

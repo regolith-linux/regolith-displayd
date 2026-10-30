@@ -25,11 +25,11 @@ Run the daemon with the command specified above. You can then use `gnome-control
 * Refresh Rate
 * Scale
 * Hotplugging monitors
+* Night Light (needs gnome-settings-daemon's color plugin running in the session and a compositor with `wlr-gamma-control`, such as sway)
 
 # What doesn't work?
 * ~~Applying **any** changes whatsoever~~
 * ~~Display page doesn't update on monitor change. **Workaround**: switch to some other page from the panel and back or restart `gnome-control-center`~~
-* Night Light
 * Screen Mirroring (sway doesn't support it and probably won't for the forseeable future).
 
 # Contributing

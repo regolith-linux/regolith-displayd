@@ -1,5 +1,7 @@
+pub mod gamma;
 pub mod modes;
 pub mod monitor;
+pub mod night_light;
 
 use core::fmt;
 use lazy_static::lazy_static;
@@ -172,6 +174,12 @@ impl DisplayServer {
     pub async fn apply_monitors_config_allowed(&self) -> bool {
         info!("Call to apply_monitors_config");
         return true;
+    }
+
+    /// Night Light is applied by this daemon (see `night_light`).
+    #[dbus_interface(property)]
+    pub async fn night_light_supported(&self) -> bool {
+        true
     }
 
     #[dbus_interface(signal)]

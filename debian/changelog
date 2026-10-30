@@ -1,3 +1,14 @@
+regolith-displayd (0.3.5) jammy; urgency=medium
+
+  [ rego-port-bot ]
+  * fix: report the current mode for outputs with no mode list
+  * fix: apply kanshi profiles reliably
+  * test: add a headless sway autopkgtest for the DisplayConfig API
+  * fix: restart kanshi when it cannot reload
+  * style: format the kanshi reload code and simplify a map_or
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Tue, 27 Oct 2026 12:00:00 -0700
+
 regolith-displayd (0.3.4) jammy; urgency=medium
 
   * Update for resolute

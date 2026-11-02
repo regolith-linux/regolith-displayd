@@ -1,3 +1,4 @@
+use crate::edid;
 use crate::modes::Modes;
 use log::warn;
 use num;
@@ -159,20 +160,66 @@ impl Hash for LogicalMonitor {
 
 impl MonitorProperties {
     pub fn new(output: &Output) -> MonitorProperties {
-        let name = Some(format!(
-            "{} {} {}",
-            &output.make, &output.model, &output.serial
-        ));
-        let builtin = output.name.starts_with("eDP");
+        MonitorProperties::with_physical_size(output, edid::physical_size_mm(&output.name))
+    }
+
+    /// `physical` is the monitor's size in millimetres, when known. Like
+    /// Mutter, GetCurrentState gives it only through the display name:
+    /// gnome-control-center appends the diagonal from "width-mm" and
+    /// "height-mm" to the name when they are set, so they stay unset.
+    /// (They used to carry `output.rect`, the logical size in pixels, which
+    /// made a 27" monitor show as 116", or 58" at scale 2.)
+    fn with_physical_size(output: &Output, physical: Option<(i32, i32)>) -> MonitorProperties {
+        let builtin = is_laptop_panel(&output.name);
         MonitorProperties {
-            width: Some(output.rect.width),
-            height: Some(output.rect.height),
-            name,
+            width: None,
+            height: None,
+            name: Some(display_name(&output.make, builtin, physical)),
             builtin: Some(builtin),
             max_size: None,
             underscanning: None,
         }
     }
+}
+
+/// Connector types of laptop panels, as Mutter tells them apart.
+fn is_laptop_panel(connector: &str) -> bool {
+    ["eDP", "LVDS", "DSI"]
+        .iter()
+        .any(|t| connector.starts_with(t))
+}
+
+/// The name Mutter gives a monitor (`meta_monitor_make_display_name`):
+/// "Built-in display" for a laptop panel, otherwise the vendor followed by
+/// the diagonal in inches when the physical size is known. sway's `make` is
+/// already the vendor name looked up from the EDID's PNP ID.
+fn display_name(make: &str, builtin: bool, physical: Option<(i32, i32)>) -> String {
+    if builtin {
+        return String::from("Built-in display");
+    }
+    let inches = physical.map(|(w, h)| diagonal_to_str((f64::from(w).hypot(f64::from(h))) / 25.4));
+    let vendor = match make.trim() {
+        "" | "Unknown" | "unknown" => match inches {
+            Some(_) => "Unknown",
+            None => "Unknown Display",
+        },
+        vendor => vendor,
+    };
+    match inches {
+        Some(inches) => format!("{vendor} {inches}"),
+        None => vendor.to_string(),
+    }
+}
+
+/// Mutter's `diagonal_to_str`: common laptop sizes keep their decimal,
+/// anything else is rounded to whole inches.
+fn diagonal_to_str(inches: f64) -> String {
+    for known in [12.1, 13.3, 15.6] {
+        if (known - inches).abs() < 0.1 {
+            return format!("{known:.1}\"");
+        }
+    }
+    format!("{}\"", (inches + 0.5) as i32)
 }
 
 impl MonitorTransform {
@@ -344,6 +391,77 @@ mod tests {
         assert_eq!(monitor.modes[0].get_id(), "1600x1000@0Hz");
         assert!(monitor.modes[0].current());
         assert_eq!(monitor.get_current_mode(), "1600x1000@0Hz");
+    }
+
+    fn output_named(name: &str, make: &str) -> Output {
+        serde_json::from_str(&format!(
+            r#"{{"id": 3, "name": "{name}", "make": "{make}", "model": "U2720Q",
+                "serial": "ABC123", "active": true, "dpms": true, "primary": false,
+                "scale": 2.0, "transform": "normal", "modes": [],
+                "current_mode": {{"width": 3840, "height": 2160, "refresh": 60000}},
+                "rect": {{"x": 0, "y": 0, "width": 1920, "height": 1080}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn size_only_in_the_name() {
+        let props = MonitorProperties::with_physical_size(
+            &output_named("DP-1", "Dell Inc."),
+            Some((600, 340)),
+        );
+        assert_eq!((props.width, props.height), (None, None));
+        assert_eq!(props.name.as_deref(), Some("Dell Inc. 27\""));
+        assert_eq!(props.builtin, Some(false));
+    }
+
+    #[test]
+    fn no_size_when_unknown() {
+        // sway's logical size (1920x1080 at scale 2) must not be reported
+        // as millimetres.
+        let props = MonitorProperties::with_physical_size(&output_named("DP-1", "Dell Inc."), None);
+        assert_eq!((props.width, props.height), (None, None));
+        assert_eq!(props.name.as_deref(), Some("Dell Inc."));
+    }
+
+    #[test]
+    fn name_has_no_model_or_serial() {
+        let props = MonitorProperties::with_physical_size(
+            &output_named("Virtual-1", "Red Hat, Inc."),
+            Some((330, 200)),
+        );
+        assert_eq!(props.name.as_deref(), Some("Red Hat, Inc. 15\""));
+    }
+
+    #[test]
+    fn laptop_panel_is_built_in_display() {
+        for connector in ["eDP-1", "LVDS-1", "DSI-1"] {
+            let props = MonitorProperties::with_physical_size(
+                &output_named(connector, "BOE"),
+                Some((340, 190)),
+            );
+            assert_eq!(props.name.as_deref(), Some("Built-in display"));
+            assert_eq!(props.builtin, Some(true));
+            assert_eq!(props.width, None);
+        }
+    }
+
+    #[test]
+    fn unknown_vendor() {
+        assert_eq!(
+            display_name("Unknown", false, Some((330, 200))),
+            "Unknown 15\""
+        );
+        assert_eq!(display_name("Unknown", false, None), "Unknown Display");
+        assert_eq!(display_name("", false, None), "Unknown Display");
+    }
+
+    #[test]
+    fn diagonals_like_mutter() {
+        assert_eq!(diagonal_to_str(15.58), "15.6\"");
+        assert_eq!(diagonal_to_str(13.3), "13.3\"");
+        assert_eq!(diagonal_to_str(27.15), "27\"");
+        assert_eq!(diagonal_to_str(23.5), "24\"");
     }
 
     #[test]

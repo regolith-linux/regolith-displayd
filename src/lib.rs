@@ -1,3 +1,4 @@
+pub mod edid;
 pub mod modes;
 pub mod monitor;
 

@@ -178,7 +178,7 @@ before=$(signals)
 # had for both outputs.
 mode=$(current_mode HEADLESS-1)
 second_mode=$(current_mode "$second")
-stale="[(0, 0, 1.0, 0, false, [('HEADLESS-1', '$mode', @a{sv} {})]), (1600, 0, 1.0, 0, false, [('$second', '$second_mode', @a{sv} {})])]"
+stale="[(0, 0, 1.0, 0, true, [('HEADLESS-1', '$mode', @a{sv} {})]), (1600, 0, 1.0, 0, false, [('$second', '$second_mode', @a{sv} {})])]"
 mkdir -p "$profiles"
 files=$(ls "$profiles")
 if ! swaymsg output "$second" unplug > "$work/unplug.log" 2>&1; then
@@ -203,7 +203,7 @@ new_serial=$(serial)
 [ "$new_serial" != "$old_serial" ] || fail "the serial is still $old_serial after the unplug"
 echo "ok: the serial moved from $old_serial to $new_serial"
 
-config="[(0, 0, 2.0, 0, false, [('HEADLESS-1', '$mode', @a{sv} {})])]"
+config="[(0, 0, 2.0, 0, true, [('HEADLESS-1', '$mode', @a{sv} {})])]"
 if dc ApplyMonitorsConfig "$old_serial" 1 "$config" "@a{sv} {}" > /dev/null 2>&1; then
     fail "an Apply with the serial from before the unplug succeeded"
 fi

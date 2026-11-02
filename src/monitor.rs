@@ -113,6 +113,18 @@ impl Monitor {
         format!("{} {} {}", desc.1, desc.2, desc.3)
     }
 
+    pub fn is_builtin(&self) -> bool {
+        self.properties.builtin == Some(true)
+    }
+
+    /// The area of the current mode, in pixels.
+    pub fn current_area(&self) -> i64 {
+        self.modes
+            .iter()
+            .find(|mode| mode.current())
+            .map_or(0, |mode| mode.width() as i64 * mode.height() as i64)
+    }
+
     /// The connector the monitor is plugged into (e.g. "DP-1").
     pub fn connector(&self) -> &str {
         &self.description.0
@@ -310,6 +322,14 @@ impl LogicalMonitor {
             },
         }
     }
+    pub fn connector(&self) -> &str {
+        &self.monitors[0].0
+    }
+
+    pub fn set_primary(&mut self, primary: bool) {
+        self.primary = primary;
+    }
+
     pub fn get_dpy_name(&self) -> String {
         let desc = &self.monitors[0];
         format!("{} {} {}", desc.1, desc.2, desc.3)
@@ -443,6 +463,10 @@ impl MonitorApply {
 
     pub fn connector(&self) -> &str {
         &self.monitors[0].0
+    }
+
+    pub fn is_primary(&self) -> bool {
+        self.primary
     }
 
     pub fn position(&self) -> (i32, i32) {

@@ -1,3 +1,4 @@
+pub mod confirm;
 pub mod edid;
 pub mod modes;
 pub mod monitor;
@@ -11,22 +12,64 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     error::Error,
-    fs::{self, File},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     thread,
     time::Duration,
 };
 use swayipc_async::{Connection, Output};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{oneshot, Mutex};
+use tokio::time::Instant;
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
 lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
+    /// The persistent change awaiting the user's answer, if any.
+    static ref PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+}
+
+/// How long the user has to keep a persistent change before it is reverted,
+/// as in GNOME.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long `ApplyMonitorsConfig` waits for the prompt to be on screen, with
+/// the keyboard, before it replies anyway.
+const PROMPT_READY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Numbers the persistent changes, so that an answer to one that another
+/// change has replaced is ignored.
+static CONFIRMATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A persistent change awaiting the user's answer. Dropping it cancels the
+/// confirmation and closes its prompt.
+struct Pending {
+    id: u64,
+    _cancel: oneshot::Sender<()>,
+}
+
+/// A persistent change to confirm, and what keeping or reverting it takes.
+struct Confirmation {
+    id: u64,
+    manager: Arc<Mutex<DisplayManager>>,
+    sway_connection: Arc<Mutex<Connection>>,
+    /// The output to show the prompt on.
+    output: String,
+    /// When the change is reverted if the user hasn't answered.
+    deadline: Instant,
+    /// The sway commands that restore the configuration from before the change.
+    previous: Vec<String>,
+    /// The primary chosen by the last Apply, and the one from before the change.
+    primary: Arc<Mutex<Option<PrimaryChoice>>>,
+    previous_primary: Option<PrimaryChoice>,
+    profile_name: String,
+    profile_buf: Vec<u8>,
 }
 
 /// Stores configrations, interacts with sway IPC and monitors hardware changes
@@ -43,9 +86,9 @@ pub struct DisplayServer {
     manager: Arc<Mutex<DisplayManager>>,
     // TODO: Make independent of sway
     sway_connection: Arc<Mutex<Connection>>,
-    /// The primary monitor chosen by the last Apply: the connectors of the
-    /// monitors it was made for, and the connector of the primary.
-    primary: Option<(Vec<String>, String)>,
+    /// The primary monitor chosen by the last Apply (see [`PrimaryChoice`]).
+    /// A persistent change that is reverted brings the previous one back.
+    primary: Arc<Mutex<Option<PrimaryChoice>>>,
 }
 
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
@@ -76,7 +119,8 @@ impl DisplayServer {
     pub async fn get_current_state(&mut self) -> DisplayManager {
         info!("Recieved 'GetCurrentState' request from control-center");
         let mut state = self.manager.lock().await.clone();
-        let chosen = match &self.primary {
+        let remembered = self.primary.lock().await.clone();
+        let chosen = match &remembered {
             Some((set, connector)) if *set == monitor_set(&state.monitors) => {
                 Some(connector.clone())
             }
@@ -89,6 +133,14 @@ impl DisplayServer {
         state
     }
 
+    /// Verify (0), or apply at once, temporarily (1) or persistently (2).
+    ///
+    /// Neither method saves anything when it applies. A persistent change
+    /// shows a prompt instead: kept, it is saved as a kanshi profile;
+    /// reverted with Escape, or not answered within [`CONFIRM_TIMEOUT`], the
+    /// configuration from just before it comes back. Any change replaces a
+    /// persistent one still awaiting an answer, which then stays as it is,
+    /// unsaved, as in GNOME.
     pub async fn apply_monitors_config(
         &mut self,
         serial: u32,
@@ -96,6 +148,7 @@ impl DisplayServer {
         mutter_logical_monitors: Vec<MonitorApply>,
         properties: DisplayManagerProperties,
     ) -> zbus::fdo::Result<()> {
+        let called = Instant::now();
         debug!("Configuration Method: {method}");
         let mut manager_obj = self.manager.lock().await;
         // Monitors plugged in or unplugged since the watcher last looked:
@@ -117,6 +170,10 @@ impl DisplayServer {
             error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
             return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
         }
+        if method > 2 {
+            error!("Invalid configuration recieved for method apply_monitors_config: Invalid method {method}");
+            return Err(zbus::fdo::Error::InvalidArgs(String::from("Invalid method")));
+        }
         // Only the logical layout mode is implemented. The request's
         // properties are options for this request: they never replace the
         // properties GetCurrentState reports.
@@ -129,9 +186,7 @@ impl DisplayServer {
         }
         // Verify the whole configuration before changing anything: an Apply
         // that cannot be satisfied is rejected atomically, and a verify call
-        // must leave no state behind. The kanshi profile is written and the
-        // reload triggered only when every requested monitor, mode, scale and
-        // transform is valid.
+        // must leave no state behind, nor touch a change awaiting an answer.
         for mutter_logical_mointor in &mutter_logical_monitors {
             mutter_logical_mointor.verify(
                 &self.sway_connection,
@@ -151,47 +206,7 @@ impl DisplayServer {
             .map(|logical| logical.connector().to_string())
             .unwrap_or_default();
 
-        if method == 1 {
-            // Temporary changes belong to this compositor session. Leave
-            // kanshi's saved configuration untouched so the next login
-            // restores the latest persistent layout and primary.
-            let mut commands = Vec::new();
-            for logical in &mutter_logical_monitors {
-                let monitor = logical
-                    .search_monitor(&manager_obj.monitors)
-                    .expect("verified monitor");
-                commands.push(logical.sway_command(monitor));
-            }
-            for monitor in &manager_obj.monitors {
-                if !mutter_logical_monitors
-                    .iter()
-                    .any(|logical| logical.connector() == monitor.connector())
-                {
-                    commands.push(format!("output {:?} disable", monitor.connector()));
-                }
-            }
-            let results = self
-                .sway_connection
-                .lock()
-                .await
-                .run_command(commands.join("; "))
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            for result in results {
-                result.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            }
-            let (monitors, logical_monitors) = manager_obj
-                .get_monitor_info(&self.sway_connection)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-            manager_obj.update(monitors, logical_monitors);
-            self.primary = Some((monitor_set(&manager_obj.monitors), primary));
-            DisplayManager::emit_monitors_changed().await?;
-            return Ok(());
-        }
-
         let (profile_name, mut profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
-        info!("Profile FileName: {profile_name}");
         if let Some(monitor) = manager_obj
             .monitors
             .iter()
@@ -203,35 +218,69 @@ impl DisplayServer {
             );
             profile_buf.splice(0..0, line.into_bytes());
         }
-        self.primary = Some((monitor_set(&manager_obj.monitors), primary));
-
-        let kanshi_paths = get_kanshi_paths().await?;
-
-        fs::create_dir_all(&kanshi_paths.profiles).unwrap();
-        let mut profile_file = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(kanshi_paths.profiles.join(&profile_name))
-            .expect("Error while opening profile file for writing");
-
-        if let Err(e) = profile_file.write(&profile_buf) {
-            error!("Error writing data to kanshi config file: {e}");
-            return Err(zbus::fdo::Error::IOError(e.to_string()));
+        let commands = manager_obj.sway_commands(&mutter_logical_monitors);
+        // What a revert goes back to: the outputs as they are now, which may
+        // be a persistent change still awaiting an answer, as in GNOME.
+        let previous = current_sway_commands(&self.sway_connection)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Cannot read the outputs: {e}")))?;
+        if let Err(e) = run_sway(&self.sway_connection, &commands).await {
+            error!("Error applying the configuration: {e}");
+            if let Err(e) = run_sway(&self.sway_connection, &previous).await {
+                error!("Error restoring the configuration: {e}");
+            }
+            return Err(zbus::fdo::Error::Failed(e));
         }
-        // An older profile for the same identical monitors names one output
-        // twice and would still keep kanshi from loading any profile.
-        set_aside_invalid_profiles(&kanshi_paths);
-        hold_profiles_for_other_monitors(&kanshi_paths, &connected_outputs(&manager_obj.monitors));
-
-        // reload kanshi config
-        if let Err(e) = reload_kanshi().await {
-            error!("Error reloading kanshi configuration: {e}");
+        info!("Applied configuration (method {method}): {}", commands.join("; "));
+        // This change replaces the one awaiting an answer, if any.
+        if PENDING.lock().await.take().is_some() {
+            info!("A newer configuration replaces the one awaiting confirmation");
         }
-        if let Err(e) = manager_obj.get_monitor_info(&self.sway_connection).await {
-            error!("Error getting output information from sway: {e}");
+        match manager_obj.get_monitor_info(&self.sway_connection).await {
+            Ok((monitors, logical_monitors)) => {
+                manager_obj.update(monitors, logical_monitors);
+            }
+            Err(e) => error!("Error getting output information from sway: {e}"),
         }
+        // The primary changes at once, like the layout.
+        let previous_primary = self
+            .primary
+            .lock()
+            .await
+            .replace((monitor_set(&manager_obj.monitors), primary));
+        let mut ready = None;
+        if method == 2 {
+            let id = CONFIRMATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            *PENDING.lock().await = Some(Pending {
+                id,
+                _cancel: cancel_tx,
+            });
+            let confirmation = Confirmation {
+                id,
+                manager: Arc::clone(&self.manager),
+                sway_connection: Arc::clone(&self.sway_connection),
+                output: prompt_output(&self.sway_connection).await,
+                deadline: called + CONFIRM_TIMEOUT,
+                previous,
+                primary: Arc::clone(&self.primary),
+                previous_primary,
+                profile_name,
+                profile_buf,
+            };
+            tokio::spawn(confirmation.run(cancel_rx, ready_tx));
+            ready = Some(ready_rx);
+        }
+        drop(manager_obj);
         DisplayManager::emit_monitors_changed().await?;
+        // Reply once the prompt can take the answer: the caller may press
+        // Enter as soon as the call returns.
+        if let Some(ready) = ready {
+            if tokio::time::timeout(PROMPT_READY_TIMEOUT, ready).await.is_err() {
+                warn!("The confirmation prompt is not on screen yet");
+            }
+        }
         Ok(())
     }
 
@@ -253,7 +302,7 @@ impl DisplayServer {
         DisplayServer {
             manager,
             sway_connection,
-            primary: None,
+            primary: Arc::new(Mutex::new(None)),
         }
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
@@ -455,6 +504,27 @@ impl DisplayManager {
         }
     }
 
+    /// The sway commands that apply `config`: the outputs it names are
+    /// enabled, and the others disabled after them, so that some output stays
+    /// on all along.
+    fn sway_commands(&self, config: &[MonitorApply]) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut active = Vec::new();
+        for mutter_logical_mointor in config {
+            let Some(monitor) = mutter_logical_mointor.search_monitor(&self.monitors) else {
+                continue;
+            };
+            if let Some(command) = mutter_logical_mointor.sway_command(monitor) {
+                commands.push(command);
+                active.push(monitor.clone());
+            }
+        }
+        for disabled in self.get_disabled_monitors(&active) {
+            commands.push(format!("output \"{}\" disable", disabled.connector()));
+        }
+        commands
+    }
+
     /// Get list of all the monitors that are not active
     fn get_disabled_monitors(&self, active_physical_monitors: &[Monitor]) -> Vec<&Monitor> {
         self.monitors
@@ -485,7 +555,11 @@ impl DisplayManager {
         sway_connection: &Mutex<Connection>,
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
-        Ok(Self::monitors_of(&outputs))
+        let (mut monitors, logical_monitors) = Self::monitors_of(&outputs);
+        for monitor in &mut monitors {
+            monitor.keep_known_modes(&self.monitors);
+        }
+        Ok((monitors, logical_monitors))
     }
 
     /// The monitors of sway's `outputs`, and the logical monitors of the
@@ -657,6 +731,10 @@ fn set_aside_invalid_profiles(paths: &KanshiPaths) {
 /// The comment that records, in a kanshi profile, which monitor an output
 /// named by its connector was saved for.
 const PINNED_OUTPUT: &str = "# regolith-displayd: output";
+
+/// A primary monitor chosen by an Apply: the connectors of the monitors it was
+/// made for, and the connector of the primary.
+type PrimaryChoice = (Vec<String>, String);
 
 /// The comment that records, in a kanshi profile, which output is primary.
 const PRIMARY_OUTPUT: &str = "# regolith-displayd: primary";
@@ -1678,6 +1756,7 @@ mod hotplug_tests {
         }
     }
 }
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;
@@ -1816,5 +1895,269 @@ mod layout_tests {
         pair(false, true).unwrap();
         assert!(pair(false, false).unwrap_err().contains("missing primary"));
         assert!(pair(true, true).unwrap_err().contains("multiple primary"));
+    }
+}
+
+impl Confirmation {
+    /// Show the prompt and wait for the answer, the timeout or a newer
+    /// change. Keep saves the change; Escape or the timeout reverts it.
+    /// `ready` is sent once the prompt is on screen with the keyboard, or
+    /// dropped if it can't be shown, in which case only the timeout applies.
+    async fn run(self, mut cancel: oneshot::Receiver<()>, ready: oneshot::Sender<()>) {
+        let mut ready = Some(ready);
+        let mut prompt = spawn_prompt(&self.output, self.deadline);
+        let mut lines = prompt
+            .as_mut()
+            .and_then(|child| child.stdout.take())
+            .map(|stdout| BufReader::new(stdout).lines());
+        let keep = loop {
+            let line = async {
+                match lines.as_mut() {
+                    Some(lines) => lines.next_line().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                line = line => match line {
+                    Ok(Some(line)) if line.trim() == "ready" => {
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(());
+                        }
+                    }
+                    Ok(Some(line)) => match confirm::Answer::from_line(&line) {
+                        Some(answer) => break answer == confirm::Answer::Keep,
+                        None => warn!("Unexpected output from the confirmation prompt: {line}"),
+                    },
+                    // The prompt is gone without an answer.
+                    Ok(None) | Err(_) => {
+                        lines = None;
+                        ready = None;
+                    }
+                },
+                _ = tokio::time::sleep_until(self.deadline) => {
+                    info!("The configuration was not confirmed in time");
+                    break false;
+                }
+                // A newer change replaced this one: dropping the prompt closes it.
+                _ = &mut cancel => return,
+            }
+        };
+        if let Some(mut child) = prompt {
+            let _ = child.kill().await;
+        }
+        let mut manager_obj = self.manager.lock().await;
+        {
+            let mut pending = PENDING.lock().await;
+            if pending.as_ref().map(|p| p.id) != Some(self.id) {
+                return;
+            }
+            *pending = None;
+        }
+        if keep {
+            info!("Configuration kept: saving profile {}", self.profile_name);
+            if let Err(e) = save_profile(&manager_obj, &self.profile_name, &self.profile_buf).await
+            {
+                error!("Error saving the kept configuration: {e}");
+            }
+        } else {
+            info!("Configuration not kept: reverting");
+            if let Err(e) = run_sway(&self.sway_connection, &self.previous).await {
+                error!("Error reverting the configuration: {e}");
+            }
+            *self.primary.lock().await = self.previous_primary;
+            match manager_obj.get_monitor_info(&self.sway_connection).await {
+                Ok((monitors, logical_monitors)) => {
+                    manager_obj.update(monitors, logical_monitors);
+                }
+                Err(e) => error!("Error getting output information from sway: {e}"),
+            }
+        }
+        drop(manager_obj);
+        if let Err(e) = DisplayManager::emit_monitors_changed().await {
+            error!("Error emitting MonitorsChanged: {e}");
+        }
+    }
+}
+
+/// Start the prompt (see [`confirm`]) on `output`, counting down to
+/// `deadline`.
+fn spawn_prompt(output: &str, deadline: Instant) -> Option<tokio::process::Child> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            error!("Cannot show the confirmation prompt: {e}");
+            return None;
+        }
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    match tokio::process::Command::new(exe)
+        .arg(confirm::PROMPT_ARG)
+        .arg(output)
+        .arg(left.as_millis().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => Some(child),
+        Err(e) => {
+            error!("Cannot show the confirmation prompt: {e}");
+            None
+        }
+    }
+}
+
+/// The sway commands that bring the outputs back to how they are now.
+async fn current_sway_commands(sway: &Mutex<Connection>) -> Result<Vec<String>, Box<dyn Error>> {
+    let outputs = sway.lock().await.get_outputs().await?;
+    Ok(restore_commands(&outputs))
+}
+
+/// The sway commands that bring `outputs` back: the active ones first, with
+/// their mode, position, scale and transform as sway reports them, then the
+/// others disabled.
+fn restore_commands(outputs: &[Output]) -> Vec<String> {
+    let mut enable = Vec::new();
+    let mut disable = Vec::new();
+    for output in outputs {
+        if !output.active {
+            disable.push(format!("output \"{}\" disable", output.name));
+            continue;
+        }
+        let mut command = format!("output \"{}\" enable", output.name);
+        if let Some(mode) = &output.current_mode {
+            if mode.refresh > 0 {
+                command.push_str(&format!(
+                    " mode {}x{}@{}Hz",
+                    mode.width,
+                    mode.height,
+                    mode.refresh as f64 / 1000.0
+                ));
+            } else {
+                command.push_str(&format!(" mode {}x{}", mode.width, mode.height));
+            }
+        }
+        command.push_str(&format!(
+            " position {} {} scale {} transform {}",
+            output.rect.x,
+            output.rect.y,
+            output.scale.unwrap_or(1.0),
+            output.transform.as_deref().unwrap_or("normal")
+        ));
+        enable.push(command);
+    }
+    enable.extend(disable);
+    enable
+}
+
+/// Run `commands` in sway, in order, as one IPC request.
+async fn run_sway(sway: &Mutex<Connection>, commands: &[String]) -> Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let joined = commands.join("; ");
+    debug!("sway: {joined}");
+    let results = sway
+        .lock()
+        .await
+        .run_command(&joined)
+        .await
+        .map_err(|e| e.to_string())?;
+    for result in results {
+        result.map_err(|e| format!("{e} ({joined})"))?;
+    }
+    Ok(())
+}
+
+/// The output to show the prompt on: the focused one if it is on, else the
+/// first output that is on.
+async fn prompt_output(sway: &Mutex<Connection>) -> String {
+    let outputs = match sway.lock().await.get_outputs().await {
+        Ok(outputs) => outputs,
+        Err(e) => {
+            error!("Error getting outputs from sway: {e}");
+            return String::new();
+        }
+    };
+    let active = || outputs.iter().filter(|o| o.active);
+    active()
+        .find(|o| o.focused)
+        .or_else(|| active().next())
+        .map(|o| o.name.clone())
+        .unwrap_or_default()
+}
+
+/// Save a kept configuration as kanshi profile `profile_name`, and have
+/// kanshi load it.
+async fn save_profile(
+    manager_obj: &DisplayManager,
+    profile_name: &str,
+    profile_buf: &[u8],
+) -> zbus::fdo::Result<()> {
+    let kanshi_paths = get_kanshi_paths().await?;
+    fs::create_dir_all(&kanshi_paths.profiles)
+        .and_then(|_| fs::write(kanshi_paths.profiles.join(profile_name), profile_buf))
+        .map_err(|e| zbus::fdo::Error::IOError(e.to_string()))?;
+    // An older profile for the same identical monitors names one output
+    // twice and would still keep kanshi from loading any profile.
+    set_aside_invalid_profiles(&kanshi_paths);
+    hold_profiles_for_other_monitors(&kanshi_paths, &connected_outputs(&manager_obj.monitors));
+    if let Err(e) = reload_kanshi().await {
+        error!("Error reloading kanshi configuration: {e}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod confirm_tests {
+    use super::*;
+
+    fn outputs() -> Vec<Output> {
+        serde_json::from_str(
+            r#"[{"id": 3, "name": "HEADLESS-1", "make": "Unknown", "model": "Unknown",
+                 "serial": "Unknown", "active": true, "dpms": true, "primary": false,
+                 "scale": 2.0, "transform": "90", "modes": [],
+                 "current_mode": {"width": 1024, "height": 768, "refresh": 60000},
+                 "rect": {"x": 80, "y": 120, "width": 384, "height": 512}},
+                {"id": 4, "name": "HEADLESS-2", "make": "Unknown", "model": "Unknown",
+                 "serial": "Unknown", "active": false, "dpms": false, "primary": false,
+                 "modes": [], "rect": {"x": 0, "y": 0, "width": 0, "height": 0}}]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_commands_replay_the_outputs_as_sway_reports_them() {
+        assert_eq!(
+            restore_commands(&outputs()),
+            [
+                "output \"HEADLESS-1\" enable mode 1024x768@60Hz position 80 120 scale 2 transform 90",
+                "output \"HEADLESS-2\" disable",
+            ]
+        );
+    }
+
+    #[test]
+    fn sway_commands_disable_the_outputs_left_out() {
+        let outputs = outputs();
+        let (monitors, _) = DisplayManager::monitors_of(&outputs);
+        let manager = DisplayManager {
+            serial: 0,
+            monitors,
+            logical_monitors: Vec::new(),
+            properties: DisplayManagerProperties::new(),
+        };
+        let config: Vec<MonitorApply> = serde_json::from_str(
+            r#"[{"x_pos": 0, "y_pos": 0, "scale": 1.0, "transform": 3, "primary": false,
+                 "monitors": [["HEADLESS-1", "1024x768@60Hz", {}]]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            manager.sway_commands(&config),
+            [
+                "output \"HEADLESS-1\" enable mode 1024x768@60Hz position 0 0 scale 1 transform 270",
+                "output \"HEADLESS-2\" disable",
+            ]
+        );
     }
 }

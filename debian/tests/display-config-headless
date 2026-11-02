@@ -3,11 +3,13 @@
 # headless sway with a real kanshi: the headless output must report a mode,
 # verify must write nothing, an unsatisfiable, empty or mirrored Apply must
 # fail without writing, a temporary Apply must take effect without writing, and
-# a persistent Apply must change the scale in sway, keep exactly one kanshi
-# alive (reloaded in place, or restarted when it cannot reload on SIGHUP) and
-# leave no zombie processes. With two outputs that report the same description,
-# the profile must name them by connector so that kanshi accepts it, and it
-# must be held back from kanshi once one of them is unplugged.
+# a persistent Apply kept with Enter at its confirmation prompt must change the
+# scale in sway, keep exactly one kanshi alive (reloaded in place, or restarted
+# when it cannot reload on SIGHUP) and leave no zombie processes, while Escape
+# or no answer within 20 seconds must bring the previous scale back without
+# saving. With two outputs that report the same description, the profile must
+# name them by connector so that kanshi accepts it, and it must be held back
+# from kanshi once one of them is unplugged.
 set -euo pipefail
 
 work=$(mktemp -d)
@@ -59,6 +61,19 @@ dc() {
 apply() {
     dc ApplyMonitorsConfig "$serial" "$1" \
         "[(0, 0, $2, 0, true, [('HEADLESS-1', '$3', @a{sv} {})])]" "@a{sv} {}"
+}
+
+# Keep a persistent change: Enter at its confirmation prompt, which has the
+# keyboard once ApplyMonitorsConfig has returned. This seat has no keyboard
+# but wtype's own, so wtype waits a little before typing, for the prompt to
+# bind the keyboard that just appeared.
+keep() {
+    wtype -s 500 -k Return
+}
+
+# saved_scale <scale>: a kept change is saved as a kanshi profile.
+saved_scale() {
+    grep -qsE " scale $1 enable$" "$profiles"/*
 }
 
 headless_output() {
@@ -201,6 +216,8 @@ echo "ok: a temporary Apply takes effect and writes nothing"
 for scale in 2 1 2; do
     previous=$(our_kanshi)
     apply 2 "$scale.0" "$mode" > /dev/null || fail "Apply of scale $scale failed"
+    keep || fail "could not keep scale $scale"
+    retry 20 saved_scale "$scale" || fail "scale $scale was not saved once kept"
     if [ "$scale_checks" = yes ]; then
         retry 40 sway_scale_is "$scale.0" || fail "scale $scale did not take effect in sway"
     fi
@@ -217,6 +234,22 @@ for scale in 2 1 2; do
 done
 grep -qF "mode $mode " "$profiles"/* || fail "the profile does not name mode $mode"
 
+# Escape at the prompt, or no answer within 20 seconds, brings back the layout
+# from just before the change, and saves nothing.
+saved=$(cat "$profiles"/* | md5sum)
+for answer in Escape timeout; do
+    apply 2 1.0 "$mode" > /dev/null || fail "Apply of scale 1 to answer with $answer failed"
+    retry 40 sway_scale_is 1.0 || fail "scale 1 did not take effect before $answer"
+    if [ "$answer" = Escape ]; then
+        wtype -s 500 -k Escape || fail "could not press Escape at the prompt"
+        retry 20 sway_scale_is 2.0 || fail "Escape did not bring scale 2 back"
+    else
+        retry 60 sway_scale_is 2.0 || fail "scale 2 did not come back 20 seconds after the change"
+    fi
+    [ "$(cat "$profiles"/* | md5sum)" = "$saved" ] || fail "a change reverted with $answer was saved"
+    echo "ok: a change reverted with $answer brings back the previous scale and saves nothing"
+done
+
 # With no kanshi running, Apply starts one. Without a systemd user manager this
 # is the direct-spawn fallback; with one, regolith-init-kanshi.service would
 # start a kanshi outside this test session, so skip it there.
@@ -226,6 +259,8 @@ if ! systemctl --user show-environment > /dev/null 2>&1; then
     wait "$old" 2> /dev/null || true
     retry 20 live_kanshis_are $((kanshis - 1)) || fail "kanshi $old did not stop"
     apply 2 1.0 "$mode" > /dev/null || fail "Apply with no kanshi running failed"
+    keep || fail "could not keep the Apply with no kanshi running"
+    retry 20 saved_scale 1 || fail "the Apply with no kanshi running was not saved once kept"
     if [ "$scale_checks" = yes ]; then
         retry 40 sway_scale_is 1.0 || fail "scale 1 did not take effect with no kanshi running"
     fi
@@ -261,6 +296,7 @@ serial=$(dc GetCurrentState | sed -E 's/^\(uint32 ([0-9]+),.*/\1/')
 dc ApplyMonitorsConfig "$serial" 2 \
     "[(0, 0, 2.0, 0, false, [('HEADLESS-1', '$mode', @a{sv} {})]), (0, 500, 1.0, 0, true, [('$second', '$second_mode', @a{sv} {})])]" \
     "@a{sv} {}" > /dev/null || fail "Apply of two identical outputs failed"
+keep || fail "could not keep the layout of the two identical outputs"
 second_at() {
     swaymsg -t get_outputs | python3 -c '
 import json, sys
@@ -276,7 +312,7 @@ fi
 retry 20 live_kanshis_are "$kanshis" || fail "live kanshi count changed: $kanshis -> $(live_kanshis)"
 name="zz-HEADLESS-1=${desc// /_}__$second=${desc// /_}"
 profile="$profiles/$name"
-[ -f "$profile" ] || fail "no profile $name: $(profile_files | tr '\n' ' ')"
+retry 20 test -f "$profile" || fail "no profile $name: $(profile_files | tr '\n' ' ')"
 grep -q "output \"HEADLESS-1\" mode " "$profile" && grep -q "output \"$second\" mode " "$profile" \
     || fail "the profile does not name the outputs by connector: $(cat "$profile")"
 grep -qx "# regolith-displayd: output \"$second\" is \"$desc\"" "$profile" \

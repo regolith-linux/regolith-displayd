@@ -65,6 +65,14 @@ impl Modes {
     pub fn get_modestr(&self) -> &str {
         &self.id
     }
+    /// The mode as sway's `output ... mode` command takes it.
+    pub fn sway_mode(&self) -> String {
+        if self.refresh_rate > 0.0 {
+            format!("{}x{}@{}Hz", self.width, self.height, self.refresh_rate)
+        } else {
+            format!("{}x{}", self.width, self.height)
+        }
+    }
     /// Whether `scale` is one of this mode's supported scales, within 1e-6:
     /// clients send either the listed (single precision) value or the exact
     /// fraction.
@@ -83,6 +91,11 @@ impl Modes {
         current.height == actual.height
             && current.width == actual.width
             && current.refresh == actual.refresh
+    }
+    /// This mode, marked current or not.
+    pub fn with_current(mut self, current: bool) -> Modes {
+        self.properties.current = Some(current);
+        self
     }
     pub fn current(&self) -> bool {
         self.properties.current == Some(true)

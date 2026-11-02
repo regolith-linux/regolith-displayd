@@ -1,11 +1,22 @@
 use log::error;
-use regolith_displayd::{DisplayManager, DisplayServer};
+use regolith_displayd::{confirm, DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc};
 use swayipc_async::Connection as SwayConection;
 use tokio::{sync::Mutex, try_join};
 
+fn main() -> Result<(), Box<dyn Error>> {
+    // The daemon runs itself with these arguments to show the prompt that
+    // confirms a persistent display change.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 && args[1] == confirm::PROMPT_ARG {
+        let millis = args[3].parse().unwrap_or(0);
+        std::process::exit(confirm::run_prompt(&args[2], millis));
+    }
+    daemon()
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn daemon() -> Result<(), Box<dyn Error>> {
     pretty_env_logger::init();
     // New pointer to Display Manager Object
     let manager = DisplayManager::new().await;

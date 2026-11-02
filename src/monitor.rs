@@ -104,6 +104,23 @@ impl Monitor {
         }
     }
 
+    /// Report the modes `known` gives for this monitor, none of them
+    /// current, if sway reports none: sway reports no mode for a headless or
+    /// other virtual output that is off, and without one it couldn't be
+    /// switched on again.
+    pub fn keep_known_modes(&mut self, known: &[Monitor]) {
+        if !self.modes.is_empty() {
+            return;
+        }
+        if let Some(previous) = known.iter().find(|monitor| *monitor == self) {
+            self.modes = previous
+                .modes
+                .iter()
+                .map(|mode| mode.clone().with_current(false))
+                .collect();
+        }
+    }
+
     pub fn search_modes(&self, mode_id: &str) -> Option<&Modes> {
         self.modes.iter().find(|&m| m.get_id() == mode_id)
     }
@@ -277,7 +294,10 @@ impl MonitorTransform {
         }
     }
 
-    pub fn to_sway(self) -> &'static str {
+    /// The transform as a kanshi profile names it. kanshi sets it through
+    /// wlr-output-management, which names the quarter turns the other way
+    /// round from sway's IPC: kanshi's "270" is what sway reports as "90".
+    pub fn to_kanshi(self) -> &'static str {
         use MonitorTransform::*;
         match self {
             Normal => "normal",
@@ -288,6 +308,22 @@ impl MonitorTransform {
             FlippedRight => "flipped-90",
             FlippedDown => "flipped-180",
             FlippedLeft => "flipped-270",
+        }
+    }
+
+    /// The transform as sway's IPC names it, in `get_outputs` and in the
+    /// `output ... transform` command: the inverse of [`Self::from_sway`].
+    pub fn to_sway(self) -> &'static str {
+        use MonitorTransform::*;
+        match self {
+            Normal => "normal",
+            Left => "90",
+            Down => "180",
+            Right => "270",
+            Flipped => "flipped",
+            FlippedLeft => "flipped-90",
+            FlippedDown => "flipped-180",
+            FlippedRight => "flipped-270",
         }
     }
 }
@@ -337,33 +373,6 @@ impl LogicalMonitor {
 }
 
 impl MonitorApply {
-    /// Apply a verified logical monitor directly to sway without saving it.
-    pub fn sway_command(&self, monitor: &Monitor) -> String {
-        let mode = self.get_modestr(monitor).expect("verified mode");
-        // Direct sway IPC must use the names GetCurrentState decodes;
-        // kanshi's rotation names have the opposite direction convention.
-        let transform = match self.transform {
-            0 => "normal",
-            1 => "90",
-            2 => "180",
-            3 => "270",
-            4 => "flipped",
-            5 => "flipped-90",
-            6 => "flipped-180",
-            7 => "flipped-270",
-            _ => unreachable!("verified transform"),
-        };
-        format!(
-            "output {:?} mode {} scale {} transform {} position {} {} enable",
-            monitor.connector(),
-            mode,
-            self.scale,
-            transform,
-            self.x_pos,
-            self.y_pos,
-        )
-    }
-
     fn get_modestr(&self, monitor: &Monitor) -> Option<String> {
         let modestr = &self.monitors[0].1;
         match monitor.search_modes(&modestr) {
@@ -401,10 +410,27 @@ impl MonitorApply {
             mode,
             self.x_pos,
             self.y_pos,
-            transform.to_sway(),
+            transform.to_kanshi(),
             self.scale
         );
         writeln!(kanshi_file, "\t{config}").unwrap();
+    }
+
+    /// The sway command that applies this logical monitor to `monitor`, or
+    /// None if `monitor` has no such mode.
+    pub fn sway_command(&self, monitor: &Monitor) -> Option<String> {
+        let mode = monitor.search_modes(&self.monitors[0].1)?;
+        let transform =
+            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
+        Some(format!(
+            "output \"{}\" enable mode {} position {} {} scale {} transform {}",
+            monitor.connector(),
+            mode.sway_mode(),
+            self.x_pos,
+            self.y_pos,
+            self.scale,
+            transform.to_sway()
+        ))
     }
 
     pub fn verify(
@@ -587,6 +613,63 @@ mod tests {
         assert_eq!(diagonal_to_str(13.3), "13.3\"");
         assert_eq!(diagonal_to_str(27.15), "27\"");
         assert_eq!(diagonal_to_str(23.5), "24\"");
+    }
+
+    #[test]
+    fn sway_and_kanshi_name_quarter_turns_the_other_way_round() {
+        for transform in 0..8 {
+            let t = MonitorTransform::from_u32(transform).unwrap();
+            let sway = Some(t.to_sway().to_string());
+            assert_eq!(MonitorTransform::from_sway(&sway) as u32, transform);
+        }
+        assert_eq!(MonitorTransform::Left.to_sway(), "90");
+        assert_eq!(MonitorTransform::Left.to_kanshi(), "270");
+        assert_eq!(MonitorTransform::FlippedRight.to_sway(), "flipped-270");
+        assert_eq!(MonitorTransform::FlippedRight.to_kanshi(), "flipped-90");
+    }
+
+    #[test]
+    fn sway_command_applies_the_logical_monitor() {
+        let monitor = Monitor::new(&output(
+            r#"[{"width": 1920, "height": 1080, "refresh": 59951},
+                {"width": 1600, "height": 1000, "refresh": 0}]"#,
+        ));
+        let apply = |mode: &str, transform| MonitorApply {
+            x_pos: 100,
+            y_pos: -20,
+            scale: 1.5,
+            transform,
+            primary: false,
+            monitors: vec![("HEADLESS-1".into(), mode.into(), MonitorProperties::new(&output("[]")))],
+        };
+        assert_eq!(
+            apply("1920x1080@59.951Hz", 1).sway_command(&monitor).as_deref(),
+            Some("output \"HEADLESS-1\" enable mode 1920x1080@59.951Hz position 100 -20 scale 1.5 transform 90")
+        );
+        assert_eq!(
+            apply("1600x1000@0Hz", 0).sway_command(&monitor).as_deref(),
+            Some("output \"HEADLESS-1\" enable mode 1600x1000 position 100 -20 scale 1.5 transform normal")
+        );
+        assert_eq!(apply("1x1@1Hz", 0).sway_command(&monitor), None);
+    }
+
+    #[test]
+    fn output_switched_off_keeps_its_known_modes() {
+        let on = Monitor::new(&output("[]"));
+        let mut off = Monitor::new(
+            &serde_json::from_str(
+                r#"{"id": 3, "name": "HEADLESS-1", "make": "Unknown", "model": "Unknown",
+                    "serial": "Unknown", "active": false, "dpms": false, "primary": false,
+                    "modes": [], "rect": {"x": 0, "y": 0, "width": 0, "height": 0}}"#,
+            )
+            .unwrap(),
+        );
+        assert!(off.modes.is_empty());
+        off.keep_known_modes(&[on]);
+        assert_eq!(off.modes.len(), 1);
+        assert_eq!(off.modes[0].get_id(), "1600x1000@0Hz");
+        assert!(!off.modes[0].current());
+        assert_eq!(off.get_current_mode(), "Unknown");
     }
 
     #[test]

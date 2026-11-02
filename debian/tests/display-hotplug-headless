@@ -211,6 +211,10 @@ fi
 echo "ok: an Apply with the serial from before the unplug is refused and writes nothing"
 
 dc ApplyMonitorsConfig "$new_serial" 2 "$config" "@a{sv} {}" > /dev/null || fail "Apply after the unplug failed"
+# Keep it at its confirmation prompt, so that it is saved. This seat has no
+# keyboard but wtype's own: wait for the prompt to bind it before typing.
+wtype -s 500 -k Return || fail "could not keep the Apply after the unplug"
+retry 20 sh -c '[ -n "$(ls "$1" | grep -vx dummy)" ]' sh "$profiles" || fail "the kept Apply wrote no profile"
 profile=$(ls -t "$profiles" | grep -vx dummy | head -n 1)
 [ -n "$profile" ] || fail "the Apply wrote no profile"
 lines=$(grep -c '^[[:space:]]*output ' "$profiles/$profile" || true)

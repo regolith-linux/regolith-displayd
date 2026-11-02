@@ -366,6 +366,16 @@ impl MonitorApply {
         monitors: &Vec<Monitor>,
         logical_monitors: &Vec<LogicalMonitor>,
     ) -> zbus::fdo::Result<()> {
+        if self.monitors.is_empty() {
+            return Err(ZError::InvalidArgs(String::from("Logical monitor is empty")));
+        }
+        // sway shows each output on its own: it cannot mirror one logical
+        // monitor on several monitors.
+        if self.monitors.len() > 1 {
+            return Err(ZError::InvalidArgs(String::from(
+                "Mirroring is not supported",
+            )));
+        }
         let monitor = self
             .search_monitor(monitors)
             .ok_or(Failed(String::from("Monitor not found")))?;
@@ -402,6 +412,34 @@ impl MonitorApply {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
         }
         Ok(())
+    }
+
+    pub fn connector(&self) -> &str {
+        &self.monitors[0].0
+    }
+
+    pub fn position(&self) -> (i32, i32) {
+        (self.x_pos, self.y_pos)
+    }
+
+    /// The size of this logical monitor in the layout, in logical pixels: the
+    /// mode, turned for a 90 or 270 degree transform, divided by the scale.
+    /// Call it once [`MonitorApply::verify`] has accepted the monitor.
+    pub fn logical_size(&self, monitors: &Vec<Monitor>) -> (i32, i32) {
+        let Some(mode) = self
+            .search_monitor(monitors)
+            .and_then(|monitor| monitor.search_modes(&self.monitors[0].1))
+        else {
+            return (0, 0);
+        };
+        let (mut width, mut height) = (mode.width(), mode.height());
+        if self.transform % 2 == 1 {
+            std::mem::swap(&mut width, &mut height);
+        }
+        (
+            (width as f64 / self.scale).round() as i32,
+            (height as f64 / self.scale).round() as i32,
+        )
     }
 }
 

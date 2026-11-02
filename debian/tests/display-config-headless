@@ -2,12 +2,12 @@
 # Drive regolith-displayd over D-Bus the way the Displays panel does, on a
 # headless sway with a real kanshi: the headless output must report a mode,
 # verify must write nothing, an unsatisfiable, empty or mirrored Apply must
-# fail without writing, and an Apply must change the scale in sway, keep
-# exactly one kanshi alive (reloaded in place, or restarted when it cannot
-# reload on SIGHUP) and leave no zombie processes. With two outputs that report
-# the same description, the profile must name them by connector so that kanshi
-# accepts it, and it must be held back from kanshi once one of them is
-# unplugged.
+# fail without writing, a temporary Apply must take effect without writing, and
+# a persistent Apply must change the scale in sway, keep exactly one kanshi
+# alive (reloaded in place, or restarted when it cannot reload on SIGHUP) and
+# leave no zombie processes. With two outputs that report the same description,
+# the profile must name them by connector so that kanshi accepts it, and it
+# must be held back from kanshi once one of them is unplugged.
 set -euo pipefail
 
 work=$(mktemp -d)
@@ -193,9 +193,14 @@ fi
     || fail "a refused configuration switched the outputs off"
 echo "ok: empty and mirrored configurations are refused and change nothing"
 
+apply 1 2.0 "$mode" > /dev/null || fail "a temporary Apply failed"
+retry 40 sway_scale_is 2.0 || fail "the temporary Apply did not take effect in sway"
+[ "$(profile_files)" = "$before" ] || fail "a temporary Apply wrote a kanshi profile"
+echo "ok: a temporary Apply takes effect and writes nothing"
+
 for scale in 2 1 2; do
     previous=$(our_kanshi)
-    apply 1 "$scale.0" "$mode" > /dev/null || fail "Apply of scale $scale failed"
+    apply 2 "$scale.0" "$mode" > /dev/null || fail "Apply of scale $scale failed"
     if [ "$scale_checks" = yes ]; then
         retry 40 sway_scale_is "$scale.0" || fail "scale $scale did not take effect in sway"
     fi
@@ -220,7 +225,7 @@ if ! systemctl --user show-environment > /dev/null 2>&1; then
     kill "$old"
     wait "$old" 2> /dev/null || true
     retry 20 live_kanshis_are $((kanshis - 1)) || fail "kanshi $old did not stop"
-    apply 1 1.0 "$mode" > /dev/null || fail "Apply with no kanshi running failed"
+    apply 2 1.0 "$mode" > /dev/null || fail "Apply with no kanshi running failed"
     if [ "$scale_checks" = yes ]; then
         retry 40 sway_scale_is 1.0 || fail "scale 1 did not take effect with no kanshi running"
     fi
@@ -253,7 +258,7 @@ serial=$(dc GetCurrentState | sed -E 's/^\(uint32 ([0-9]+),.*/\1/')
 
 # HEADLESS-1 at scale 2 (800x500 logical), $second below it, where sway would
 # not put it by itself.
-dc ApplyMonitorsConfig "$serial" 1 \
+dc ApplyMonitorsConfig "$serial" 2 \
     "[(0, 0, 2.0, 0, false, [('HEADLESS-1', '$mode', @a{sv} {})]), (0, 500, 1.0, 0, false, [('$second', '$second_mode', @a{sv} {})])]" \
     "@a{sv} {}" > /dev/null || fail "Apply of two identical outputs failed"
 second_at() {

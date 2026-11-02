@@ -317,6 +317,33 @@ impl LogicalMonitor {
 }
 
 impl MonitorApply {
+    /// Apply a verified logical monitor directly to sway without saving it.
+    pub fn sway_command(&self, monitor: &Monitor) -> String {
+        let mode = self.get_modestr(monitor).expect("verified mode");
+        // Direct sway IPC must use the names GetCurrentState decodes;
+        // kanshi's rotation names have the opposite direction convention.
+        let transform = match self.transform {
+            0 => "normal",
+            1 => "90",
+            2 => "180",
+            3 => "270",
+            4 => "flipped",
+            5 => "flipped-90",
+            6 => "flipped-180",
+            7 => "flipped-270",
+            _ => unreachable!("verified transform"),
+        };
+        format!(
+            "output {:?} mode {} scale {} transform {} position {} {} enable",
+            monitor.connector(),
+            mode,
+            self.scale,
+            transform,
+            self.x_pos,
+            self.y_pos,
+        )
+    }
+
     fn get_modestr(&self, monitor: &Monitor) -> Option<String> {
         let modestr = &self.monitors[0].1;
         match monitor.search_modes(&modestr) {

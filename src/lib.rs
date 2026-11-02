@@ -110,7 +110,11 @@ impl DisplayServer {
         // reload triggered only when every requested monitor, mode, scale and
         // transform is valid.
         for mutter_logical_mointor in &mutter_logical_monitors {
-            mutter_logical_mointor.verify(&self.sway_connection, &manager_obj.monitors)?;
+            mutter_logical_mointor.verify(
+                &self.sway_connection,
+                &manager_obj.monitors,
+                &manager_obj.logical_monitors,
+            )?;
         }
         if method == 0 {
             return Ok(());

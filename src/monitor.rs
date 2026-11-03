@@ -364,6 +364,7 @@ impl MonitorApply {
         &self,
         _sway_connect: &Arc<Mutex<Connection>>,
         monitors: &Vec<Monitor>,
+        logical_monitors: &Vec<LogicalMonitor>,
     ) -> zbus::fdo::Result<()> {
         let monitor = self
             .search_monitor(monitors)
@@ -381,8 +382,20 @@ impl MonitorApply {
                 "Invalid resolution / refresh rate",
             )))?;
 
-        if !mode.is_valid_scale(self.scale) {
-            return Err(ZError::InvalidArgs(String::from("Invalid scale")));
+        // A scale set outside Settings (sway's configuration, an older
+        // profile) is kept while the monitor keeps its mode, so that it doesn't
+        // block every other change.
+        let unchanged_scale = mode.current()
+            && self
+                .search_logical_monitor(logical_monitors)
+                .map_or(false, |current| (current.scale - self.scale).abs() < 1e-6);
+        if !mode.is_valid_scale(self.scale) && !unchanged_scale {
+            return Err(ZError::InvalidArgs(format!(
+                "Scale {} not valid for resolution {}x{}",
+                self.scale,
+                mode.width(),
+                mode.height()
+            )));
         }
 
         if MonitorTransform::from_u32(self.transform) == None {

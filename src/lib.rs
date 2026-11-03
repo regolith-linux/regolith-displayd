@@ -104,6 +104,16 @@ impl DisplayServer {
             error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
             return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
         }
+        // Only the logical layout mode is implemented. The request's
+        // properties are options for this request: they never replace the
+        // properties GetCurrentState reports.
+        if let Some(layout) = properties.layout {
+            if layout != 1 {
+                return Err(zbus::fdo::Error::InvalidArgs(String::from(
+                    "Can't set layout mode",
+                )));
+            }
+        }
         // Verify the whole configuration before changing anything: an Apply
         // that cannot be satisfied is rejected atomically, and a verify call
         // must leave no state behind. The kanshi profile is written and the
@@ -125,7 +135,6 @@ impl DisplayServer {
         info!("Profile FileName: {profile_name}");
 
         let kanshi_paths = get_kanshi_paths().await?;
-        manager_obj.properties = properties;
 
         fs::create_dir_all(&kanshi_paths.profiles).unwrap();
         let mut profile_file = File::options()
@@ -408,7 +417,8 @@ impl DisplayManagerProperties {
     pub fn new() -> DisplayManagerProperties {
         DisplayManagerProperties {
             layout: Some(1),
-            support_layout_change: Some(true),
+            // Only the logical layout mode is implemented.
+            support_layout_change: None,
             global_scale: Some(false),
             legacy_scale_factor: Some(1),
         }

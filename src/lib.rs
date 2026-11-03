@@ -43,6 +43,9 @@ pub struct DisplayServer {
     manager: Arc<Mutex<DisplayManager>>,
     // TODO: Make independent of sway
     sway_connection: Arc<Mutex<Connection>>,
+    /// The primary monitor chosen by the last Apply: the connectors of the
+    /// monitors it was made for, and the connector of the primary.
+    primary: Option<(Vec<String>, String)>,
 }
 
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
@@ -72,8 +75,18 @@ pub struct KanshiPaths {
 impl DisplayServer {
     pub async fn get_current_state(&mut self) -> DisplayManager {
         info!("Recieved 'GetCurrentState' request from control-center");
-        let manager_ref = self.manager.lock().await;
-        manager_ref.clone()
+        let mut state = self.manager.lock().await.clone();
+        let chosen = match &self.primary {
+            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
+                Some(connector.clone())
+            }
+            _ => match get_kanshi_paths().await {
+                Ok(paths) => state.saved_primary(&paths),
+                Err(_) => None,
+            },
+        };
+        state.mark_primary(chosen.as_deref());
+        state
     }
 
     pub async fn apply_monitors_config(
@@ -131,10 +144,17 @@ impl DisplayServer {
             return Ok(());
         }
 
+        // verify_layout made sure there is exactly one primary.
+        let primary = mutter_logical_monitors
+            .iter()
+            .find(|logical| logical.is_primary())
+            .map(|logical| logical.connector().to_string())
+            .unwrap_or_default();
+
         if method == 1 {
             // Temporary changes belong to this compositor session. Leave
             // kanshi's saved configuration untouched so the next login
-            // restores the latest persistent layout.
+            // restores the latest persistent layout and primary.
             let mut commands = Vec::new();
             for logical in &mutter_logical_monitors {
                 let monitor = logical
@@ -165,12 +185,25 @@ impl DisplayServer {
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
             manager_obj.update(monitors, logical_monitors);
+            self.primary = Some((monitor_set(&manager_obj.monitors), primary));
             DisplayManager::emit_monitors_changed().await?;
             return Ok(());
         }
 
-        let (profile_name, profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
+        let (profile_name, mut profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
         info!("Profile FileName: {profile_name}");
+        if let Some(monitor) = manager_obj
+            .monitors
+            .iter()
+            .find(|monitor| monitor.connector() == primary)
+        {
+            let line = format!(
+                "{PRIMARY_OUTPUT} \"{}\"\n",
+                monitor.kanshi_name(&manager_obj.monitors)
+            );
+            profile_buf.splice(0..0, line.into_bytes());
+        }
+        self.primary = Some((monitor_set(&manager_obj.monitors), primary));
 
         let kanshi_paths = get_kanshi_paths().await?;
 
@@ -220,6 +253,7 @@ impl DisplayServer {
         DisplayServer {
             manager,
             sway_connection,
+            primary: None,
         }
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
@@ -310,28 +344,7 @@ impl DisplayManager {
     /// that matches in file name order, prefers a profile saved for the
     /// monitors by their descriptions.
     fn kanshi_profile(&self, config: &[MonitorApply]) -> (String, Vec<u8>) {
-        let mut names = Vec::new();
-        let mut pinned = Vec::new();
-        for monitor in &self.monitors {
-            let name = monitor.kanshi_name(&self.monitors);
-            let description = monitor.get_dpy_name();
-            if name == description {
-                names.push(description);
-            } else {
-                names.push(format!("{name}={description}"));
-                pinned.push((name, description));
-            }
-        }
-        names.sort();
-        pinned.sort();
-        let mut profile_name = names
-            .iter()
-            .map(|name| name.replace(' ', "_"))
-            .collect::<Vec<String>>()
-            .join("__");
-        if !pinned.is_empty() {
-            profile_name.insert_str(0, "zz-");
-        }
+        let (profile_name, pinned) = self.kanshi_profile_name();
 
         let mut profile_buf = Vec::new();
         let mut active_physical_monitors = Vec::new();
@@ -368,6 +381,78 @@ impl DisplayManager {
         }
         writeln!(&mut profile_buf, "}}").unwrap();
         (profile_name, profile_buf)
+    }
+
+    /// The file name of the kanshi profile for the connected monitors, and
+    /// the outputs it names by connector, with the monitor saved for each.
+    fn kanshi_profile_name(&self) -> (String, Vec<(String, String)>) {
+        let mut names = Vec::new();
+        let mut pinned = Vec::new();
+        for monitor in &self.monitors {
+            let name = monitor.kanshi_name(&self.monitors);
+            let description = monitor.get_dpy_name();
+            if name == description {
+                names.push(description);
+            } else {
+                names.push(format!("{name}={description}"));
+                pinned.push((name, description));
+            }
+        }
+        names.sort();
+        pinned.sort();
+        let mut profile_name = names
+            .iter()
+            .map(|name| name.replace(' ', "_"))
+            .collect::<Vec<String>>()
+            .join("__");
+        if !pinned.is_empty() {
+            profile_name.insert_str(0, "zz-");
+        }
+        (profile_name, pinned)
+    }
+
+    /// The primary monitor saved with the profile of the connected monitors,
+    /// by connector.
+    fn saved_primary(&self, paths: &KanshiPaths) -> Option<String> {
+        let (profile_name, _) = self.kanshi_profile_name();
+        let profile = fs::read_to_string(paths.profiles.join(profile_name)).ok()?;
+        let name = profile.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix(PRIMARY_OUTPUT)?.trim();
+            rest.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
+        })?;
+        self.monitors
+            .iter()
+            .find(|monitor| monitor.kanshi_name(&self.monitors) == name)
+            .map(|monitor| monitor.connector().to_string())
+    }
+
+    /// Mark exactly one logical monitor as primary, as Mutter always does:
+    /// the `chosen` monitor if it is on, else the built-in panel, else the
+    /// monitor with the largest mode (the first of them on a tie).
+    fn mark_primary(&mut self, chosen: Option<&str>) {
+        let active: Vec<&Monitor> = self
+            .monitors
+            .iter()
+            .filter(|monitor| {
+                self.logical_monitors
+                    .iter()
+                    .any(|logical| logical.connector() == monitor.connector())
+            })
+            .collect();
+        let primary = chosen
+            .and_then(|chosen| active.iter().find(|monitor| monitor.connector() == chosen))
+            .or_else(|| active.iter().find(|monitor| monitor.is_builtin()))
+            .or_else(|| {
+                active.iter().fold(None, |best: Option<&&Monitor>, monitor| match best {
+                    Some(b) if b.current_area() >= monitor.current_area() => Some(b),
+                    _ => Some(monitor),
+                })
+            })
+            .map(|monitor| monitor.connector().to_string());
+        for logical in &mut self.logical_monitors {
+            let is_primary = Some(logical.connector()) == primary.as_deref();
+            logical.set_primary(is_primary);
+        }
     }
 
     /// Get list of all the monitors that are not active
@@ -573,11 +658,21 @@ fn set_aside_invalid_profiles(paths: &KanshiPaths) {
 /// named by its connector was saved for.
 const PINNED_OUTPUT: &str = "# regolith-displayd: output";
 
+/// The comment that records, in a kanshi profile, which output is primary.
+const PRIMARY_OUTPUT: &str = "# regolith-displayd: primary";
+
+/// The connectors of `monitors`, sorted: which monitors a choice was made for.
+fn monitor_set(monitors: &[Monitor]) -> Vec<String> {
+    let mut set: Vec<String> = monitors.iter().map(|m| m.connector().to_string()).collect();
+    set.sort();
+    set
+}
+
 /// Refuse a configuration Mutter refuses
 /// (`meta_verify_logical_monitor_config_list`), or that sway cannot show:
 /// no logical monitor, a monitor used twice, a negative position, overlapping
-/// logical monitors, logical monitors not all connected by shared edges, or a
-/// layout that doesn't start at (0, 0).
+/// logical monitors, logical monitors not all connected by shared edges, a
+/// layout that doesn't start at (0, 0), or not exactly one primary.
 /// Each logical monitor has already passed [`MonitorApply::verify`].
 fn verify_layout(config: &[MonitorApply], monitors: &Vec<Monitor>) -> zbus::fdo::Result<()> {
     let invalid = |message: &str| Err(zbus::fdo::Error::InvalidArgs(message.to_string()));
@@ -631,7 +726,11 @@ fn verify_layout(config: &[MonitorApply], monitors: &Vec<Monitor>) -> zbus::fdo:
     if rects.iter().map(|r| r.0).min() != Some(0) || rects.iter().map(|r| r.1).min() != Some(0) {
         return invalid("Logical monitors positions are offset");
     }
-    Ok(())
+    match config.iter().filter(|logical| logical.is_primary()).count() {
+        0 => invalid("Config is missing primary logical"),
+        1 => Ok(()),
+        _ => invalid("Config contains multiple primary logical monitors"),
+    }
 }
 
 /// The connectors a profile names, with the description of the monitor it was
@@ -1579,7 +1678,6 @@ mod hotplug_tests {
         }
     }
 }
-
 #[cfg(test)]
 mod layout_tests {
     use super::*;
@@ -1616,8 +1714,21 @@ mod layout_tests {
         .unwrap()
     }
 
+    /// `logical`, primary or not.
+    fn primary(logical: &MonitorApply, primary: bool) -> MonitorApply {
+        let mut value = serde_json::to_value(logical).unwrap();
+        value["primary"] = serde_json::json!(primary);
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// Check `config` with its first logical monitor primary.
     fn check(config: &[MonitorApply]) -> Result<(), String> {
-        verify_layout(config, &monitors()).map_err(|e| e.to_string())
+        let config: Vec<MonitorApply> = config
+            .iter()
+            .enumerate()
+            .map(|(i, logical)| primary(logical, i == 0))
+            .collect();
+        verify_layout(&config, &monitors()).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -1644,5 +1755,66 @@ mod layout_tests {
         // Touching only at a corner.
         refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1920, 1080, 1.0, 0, &["DP-2"])], "adjacent");
         refused(&[logical(100, 0, 1.0, 0, &["DP-1"])], "offset");
+    }
+
+    /// The primary GetCurrentState reports for these sway outputs: the
+    /// connector, mode width and connector type of each.
+    fn reported_primary(outputs: &[(&str, i32)], chosen: Option<&str>) -> String {
+        let outputs: Vec<Output> = outputs
+            .iter()
+            .map(|(connector, width)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": 1, "name": connector, "make": "Acme", "model": connector,
+                    "serial": "0", "active": true, "dpms": true, "primary": false,
+                    "scale": 1.0, "transform": "normal",
+                    "modes": [{"width": width, "height": 1080, "refresh": 60000}],
+                    "current_mode": {"width": width, "height": 1080, "refresh": 60000},
+                    "rect": {"x": 0, "y": 0, "width": width, "height": 1080}
+                }))
+                .unwrap()
+            })
+            .collect();
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(&outputs);
+        let mut manager = DisplayManager {
+            serial: 0,
+            monitors,
+            logical_monitors,
+            properties: DisplayManagerProperties::new(),
+        };
+        manager.mark_primary(chosen);
+        let primaries: Vec<&str> = manager
+            .logical_monitors
+            .iter()
+            .filter(|logical| serde_json::to_value(logical).unwrap()["primary"] == true)
+            .map(|logical| logical.connector())
+            .collect();
+        assert_eq!(primaries.len(), 1, "{primaries:?}");
+        primaries[0].to_string()
+    }
+
+    #[test]
+    fn one_primary_is_always_reported() {
+        let outputs = [("DP-1", 1920), ("eDP-1", 1280), ("DP-2", 2560)];
+        assert_eq!(reported_primary(&outputs, Some("DP-1")), "DP-1");
+        // No choice, or a monitor that isn't there: the laptop panel.
+        assert_eq!(reported_primary(&outputs, None), "eDP-1");
+        assert_eq!(reported_primary(&outputs, Some("HDMI-1")), "eDP-1");
+        // No laptop panel: the largest mode, the first of them on a tie.
+        assert_eq!(reported_primary(&[("DP-1", 1920), ("DP-2", 2560)], None), "DP-2");
+        assert_eq!(reported_primary(&[("DP-1", 1920), ("DP-2", 1920)], None), "DP-1");
+    }
+
+    #[test]
+    fn exactly_one_primary() {
+        let pair = |first: bool, second: bool| {
+            let config = [
+                primary(&logical(0, 0, 1.0, 0, &["DP-1"]), first),
+                primary(&logical(1920, 0, 1.0, 0, &["DP-2"]), second),
+            ];
+            verify_layout(&config, &monitors()).map_err(|e| e.to_string())
+        };
+        pair(false, true).unwrap();
+        assert!(pair(false, false).unwrap_err().contains("missing primary"));
+        assert!(pair(true, true).unwrap_err().contains("multiple primary"));
     }
 }

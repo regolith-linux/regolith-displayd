@@ -131,6 +131,44 @@ impl DisplayServer {
             return Ok(());
         }
 
+        if method == 1 {
+            // Temporary changes belong to this compositor session. Leave
+            // kanshi's saved configuration untouched so the next login
+            // restores the latest persistent layout.
+            let mut commands = Vec::new();
+            for logical in &mutter_logical_monitors {
+                let monitor = logical
+                    .search_monitor(&manager_obj.monitors)
+                    .expect("verified monitor");
+                commands.push(logical.sway_command(monitor));
+            }
+            for monitor in &manager_obj.monitors {
+                if !mutter_logical_monitors
+                    .iter()
+                    .any(|logical| logical.connector() == monitor.connector())
+                {
+                    commands.push(format!("output {:?} disable", monitor.connector()));
+                }
+            }
+            let results = self
+                .sway_connection
+                .lock()
+                .await
+                .run_command(commands.join("; "))
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            for result in results {
+                result.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            }
+            let (monitors, logical_monitors) = manager_obj
+                .get_monitor_info(&self.sway_connection)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            manager_obj.update(monitors, logical_monitors);
+            DisplayManager::emit_monitors_changed().await?;
+            return Ok(());
+        }
+
         let (profile_name, profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
         info!("Profile FileName: {profile_name}");
 

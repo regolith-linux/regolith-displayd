@@ -210,7 +210,7 @@ fi
 [ "$(ls "$profiles")" = "$files" ] || fail "a refused Apply wrote a kanshi profile"
 echo "ok: an Apply with the serial from before the unplug is refused and writes nothing"
 
-dc ApplyMonitorsConfig "$new_serial" 1 "$config" "@a{sv} {}" > /dev/null || fail "Apply after the unplug failed"
+dc ApplyMonitorsConfig "$new_serial" 2 "$config" "@a{sv} {}" > /dev/null || fail "Apply after the unplug failed"
 profile=$(ls -t "$profiles" | grep -vx dummy | head -n 1)
 [ -n "$profile" ] || fail "the Apply wrote no profile"
 lines=$(grep -c '^[[:space:]]*output ' "$profiles/$profile" || true)

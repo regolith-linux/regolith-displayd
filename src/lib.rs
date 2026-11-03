@@ -116,6 +116,7 @@ impl DisplayServer {
                 &manager_obj.logical_monitors,
             )?;
         }
+        verify_layout(&mutter_logical_monitors, &manager_obj.monitors)?;
         if method == 0 {
             return Ok(());
         }
@@ -523,6 +524,67 @@ fn set_aside_invalid_profiles(paths: &KanshiPaths) {
 /// The comment that records, in a kanshi profile, which monitor an output
 /// named by its connector was saved for.
 const PINNED_OUTPUT: &str = "# regolith-displayd: output";
+
+/// Refuse a configuration Mutter refuses
+/// (`meta_verify_logical_monitor_config_list`), or that sway cannot show:
+/// no logical monitor, a monitor used twice, a negative position, overlapping
+/// logical monitors, logical monitors not all connected by shared edges, or a
+/// layout that doesn't start at (0, 0).
+/// Each logical monitor has already passed [`MonitorApply::verify`].
+fn verify_layout(config: &[MonitorApply], monitors: &Vec<Monitor>) -> zbus::fdo::Result<()> {
+    let invalid = |message: &str| Err(zbus::fdo::Error::InvalidArgs(message.to_string()));
+    if config.is_empty() {
+        return invalid("Monitors config incomplete");
+    }
+    let mut seen = HashSet::new();
+    for logical in config {
+        if !seen.insert(logical.connector()) {
+            return invalid("A monitor is assigned twice");
+        }
+    }
+    let rects: Vec<(i32, i32, i32, i32)> = config
+        .iter()
+        .map(|logical| {
+            let (x, y) = logical.position();
+            let (w, h) = logical.logical_size(monitors);
+            (x, y, x + w, y + h)
+        })
+        .collect();
+    if rects.iter().any(|r| r.0 < 0 || r.1 < 0) {
+        return invalid("Invalid logical monitor position");
+    }
+    for (i, a) in rects.iter().enumerate() {
+        for b in &rects[i + 1..] {
+            if a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3 {
+                return invalid("Logical monitors overlap");
+            }
+        }
+    }
+    // Adjacent: sharing a stretch of an edge, not just a corner
+    // (mtk_rectangle_is_adjacent_to).
+    let adjacent = |a: &(i32, i32, i32, i32), b: &(i32, i32, i32, i32)| {
+        ((a.0 == b.2 || a.2 == b.0) && !(a.3 <= b.1 || a.1 >= b.3))
+            || ((a.1 == b.3 || a.3 == b.1) && !(a.2 <= b.0 || a.0 >= b.2))
+    };
+    let mut reached = vec![false; rects.len()];
+    let mut todo = vec![0];
+    reached[0] = true;
+    while let Some(i) = todo.pop() {
+        for j in 0..rects.len() {
+            if !reached[j] && adjacent(&rects[i], &rects[j]) {
+                reached[j] = true;
+                todo.push(j);
+            }
+        }
+    }
+    if reached.iter().any(|r| !r) {
+        return invalid("Logical monitors not adjacent");
+    }
+    if rects.iter().map(|r| r.0).min() != Some(0) || rects.iter().map(|r| r.1).min() != Some(0) {
+        return invalid("Logical monitors positions are offset");
+    }
+    Ok(())
+}
 
 /// The connectors a profile names, with the description of the monitor it was
 /// saved for on each (see [`DisplayManager::kanshi_profile`]).
@@ -1467,5 +1529,72 @@ mod hotplug_tests {
             // The same monitors: a configuration for them is still valid.
             assert_eq!(manager.serial, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Two 1920x1080 monitors, DP-1 and DP-2.
+    fn monitors() -> Vec<Monitor> {
+        let outputs: Vec<Output> = ["DP-1", "DP-2"]
+            .iter()
+            .map(|connector| {
+                serde_json::from_value(serde_json::json!({
+                    "id": 1, "name": connector, "make": "Acme", "model": connector,
+                    "serial": "0", "active": true, "dpms": true, "primary": false,
+                    "scale": 1.0, "transform": "normal",
+                    "modes": [{"width": 1920, "height": 1080, "refresh": 60000}],
+                    "current_mode": {"width": 1920, "height": 1080, "refresh": 60000},
+                    "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}
+                }))
+                .unwrap()
+            })
+            .collect();
+        DisplayManager::monitors_of(&outputs).0
+    }
+
+    /// A logical monitor at (`x`, `y`) showing `connectors` at 1920x1080.
+    fn logical(x: i32, y: i32, scale: f64, transform: u32, connectors: &[&str]) -> MonitorApply {
+        let monitors: Vec<_> = connectors
+            .iter()
+            .map(|c| serde_json::json!([c, "1920x1080@60Hz", {}]))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "x_pos": x, "y_pos": y, "scale": scale, "transform": transform,
+            "primary": true, "monitors": monitors
+        }))
+        .unwrap()
+    }
+
+    fn check(config: &[MonitorApply]) -> Result<(), String> {
+        verify_layout(config, &monitors()).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn valid_layouts_are_accepted() {
+        check(&[logical(0, 0, 1.0, 0, &["DP-1"])]).unwrap();
+        check(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1920, 0, 1.0, 0, &["DP-2"])]).unwrap();
+        // Stacked, with only part of an edge shared.
+        check(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(960, 1080, 1.0, 0, &["DP-2"])]).unwrap();
+        // Scaled and rotated: 960x540 and 1080x1920 logical pixels.
+        check(&[logical(0, 0, 2.0, 0, &["DP-1"]), logical(960, 0, 1.0, 1, &["DP-2"])]).unwrap();
+    }
+
+    #[test]
+    fn invalid_layouts_are_refused() {
+        let refused = |config: &[MonitorApply], why: &str| {
+            let error = check(config).unwrap_err();
+            assert!(error.contains(why), "{error} does not say {why}");
+        };
+        refused(&[], "incomplete");
+        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1920, 0, 1.0, 0, &["DP-1"])], "twice");
+        refused(&[logical(-1920, 0, 1.0, 0, &["DP-1"]), logical(0, 0, 1.0, 0, &["DP-2"])], "position");
+        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1000, 0, 1.0, 0, &["DP-2"])], "overlap");
+        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(2000, 0, 1.0, 0, &["DP-2"])], "adjacent");
+        // Touching only at a corner.
+        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1920, 1080, 1.0, 0, &["DP-2"])], "adjacent");
+        refused(&[logical(100, 0, 1.0, 0, &["DP-1"])], "offset");
     }
 }

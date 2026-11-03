@@ -1,12 +1,13 @@
 #!/bin/bash
 # Drive regolith-displayd over D-Bus the way the Displays panel does, on a
 # headless sway with a real kanshi: the headless output must report a mode,
-# verify must write nothing, an unsatisfiable Apply must fail without writing,
-# and an Apply must change the scale in sway, keep exactly one kanshi alive
-# (reloaded in place, or restarted when it cannot reload on SIGHUP) and leave
-# no zombie processes. With two outputs that report the same description, the
-# profile must name them by connector so that kanshi accepts it, and it must be
-# held back from kanshi once one of them is unplugged.
+# verify must write nothing, an unsatisfiable, empty or mirrored Apply must
+# fail without writing, and an Apply must change the scale in sway, keep
+# exactly one kanshi alive (reloaded in place, or restarted when it cannot
+# reload on SIGHUP) and leave no zombie processes. With two outputs that report
+# the same description, the profile must name them by connector so that kanshi
+# accepts it, and it must be held back from kanshi once one of them is
+# unplugged.
 set -euo pipefail
 
 work=$(mktemp -d)
@@ -176,6 +177,21 @@ echo "ok: verify accepts $mode and writes nothing"
 if apply 1 2.0 1x1@1Hz > /dev/null 2>&1; then fail "an Apply with an unknown mode succeeded"; fi
 [ "$(profile_files)" = "$before" ] || fail "a failed Apply wrote a kanshi profile"
 echo "ok: an Apply with an unknown mode fails and writes nothing"
+
+# An empty configuration would switch every output off, and a logical monitor
+# with two monitors asks for mirroring, which sway can't do.
+if dc ApplyMonitorsConfig "$serial" 1 "@a(iiduba(ssa{sv})) []" "@a{sv} {}" > /dev/null 2>&1; then
+    fail "an empty configuration was accepted"
+fi
+if dc ApplyMonitorsConfig "$serial" 1 \
+    "[(0, 0, 1.0, 0, true, [('HEADLESS-1', '$mode', @a{sv} {}), ('HEADLESS-1', '$mode', @a{sv} {})])]" \
+    "@a{sv} {}" > /dev/null 2>&1; then
+    fail "a mirrored configuration was accepted"
+fi
+[ "$(profile_files)" = "$before" ] || fail "a refused configuration wrote a kanshi profile"
+[ "$(swaymsg -t get_outputs | python3 -c 'import json, sys; print(sum(o["active"] for o in json.load(sys.stdin)))')" -ge 1 ] \
+    || fail "a refused configuration switched the outputs off"
+echo "ok: empty and mirrored configurations are refused and change nothing"
 
 for scale in 2 1 2; do
     previous=$(our_kanshi)

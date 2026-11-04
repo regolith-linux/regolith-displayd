@@ -97,13 +97,14 @@ live_kanshis_are() {
 }
 
 # The kanshi this test runs: the one it started, or the one regolith-displayd
-# started in its place.
+# started in its place. Prints nothing if neither is running.
 our_kanshi() {
     if ps -o stat= -p "$kanshi" | grep -qv '^Z'; then
         echo "$kanshi"
         return
     fi
-    ps --ppid "$displayd" -o pid=,stat=,comm= | awk '$3 == "kanshi" && $2 !~ /^Z/ {print $1}'
+    # ps fails when regolith-displayd has no child at all.
+    { ps --ppid "$displayd" -o pid=,stat=,comm= || true; } | awk '$3 == "kanshi" && $2 !~ /^Z/ {print $1}'
 }
 
 catches_sighup() {
@@ -247,6 +248,7 @@ for answer in Escape timeout; do
         retry 60 sway_scale_is 2.0 || fail "scale 2 did not come back 20 seconds after the change"
     fi
     [ "$(cat "$profiles"/* | md5sum)" = "$saved" ] || fail "a change reverted with $answer was saved"
+    kill -0 "$displayd" 2> /dev/null || fail "regolith-displayd exited after a change reverted with $answer"
     echo "ok: a change reverted with $answer brings back the previous scale and saves nothing"
 done
 
@@ -255,8 +257,18 @@ done
 # start a kanshi outside this test session, so skip it there.
 if ! systemctl --user show-environment > /dev/null 2>&1; then
     old=$(our_kanshi)
-    kill "$old"
-    wait "$old" 2> /dev/null || true
+    if [ -n "$old" ]; then
+        kill $old
+        wait $old 2> /dev/null || true
+    else
+        # Nothing has stopped kanshi since the last kept change: a revert
+        # does not touch it. If it is gone anyway (kanshi 1.2 on jammy, which
+        # cannot apply a profile to a headless output, may exit while the
+        # outputs change under it), the Apply below still has no kanshi to
+        # reload, which is what this checks. regolith-displayd itself must
+        # still be running, which the revert checks above made sure of.
+        echo "note: kanshi had already exited; regolith-displayd log: $(tail -n 20 "$work/displayd.log" | tr '\n' ' ')"
+    fi
     retry 20 live_kanshis_are $((kanshis - 1)) || fail "kanshi $old did not stop"
     apply 2 1.0 "$mode" > /dev/null || fail "Apply with no kanshi running failed"
     keep || fail "could not keep the Apply with no kanshi running"

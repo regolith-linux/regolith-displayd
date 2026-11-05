@@ -1410,22 +1410,28 @@ mod tests {
         let uid = fs::metadata("/proc/self").unwrap().uid();
         let calls = || fs::read_to_string(&log).unwrap_or_default();
 
-        // Live kanshis, the way the grading stub looks: executables whose
-        // comm is exactly "kanshi". They live outside PATH so the spawn
-        // fallback below still resolves the fake script. One catches
-        // SIGHUP like kanshi 1.3 and later; the other (a copy of sleep)
-        // keeps the default action like kanshi 1.2.
+        // Live kanshis: executables whose comm is exactly "kanshi". They
+        // live outside PATH so the spawn fallback below still resolves the
+        // fake script. One catches SIGHUP like kanshi 1.3 and later; the
+        // other keeps the default action like kanshi 1.2. Both are shell
+        // scripts, since the kernel takes comm from the executed file name.
+        // A copy of a system binary is not usable: a multicall binary such
+        // as uutils coreutils dispatches on its name and exits at once.
+        // Both wait in the shell's built-in read on a pipe from the test
+        // and never fork: a child is also named "kanshi" until it execs,
+        // and it would neither catch SIGHUP nor be stopped with its parent.
         let reloading_bin = dir.join("reloading").join("kanshi");
         let exiting_bin = dir.join("exiting").join("kanshi");
         fs::create_dir_all(reloading_bin.parent().unwrap()).unwrap();
         fs::create_dir_all(exiting_bin.parent().unwrap()).unwrap();
         fs::write(
             &reloading_bin,
-            "#!/bin/sh\ntrap : HUP\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\ntrap : HUP\nwhile :; do read -r _; done\n",
         )
         .unwrap();
         fs::set_permissions(&reloading_bin, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::copy("/bin/sleep", &exiting_bin).unwrap();
+        fs::write(&exiting_bin, "#!/bin/sh\nread -r _\n").unwrap();
+        fs::set_permissions(&exiting_bin, fs::Permissions::from_mode(0o755)).unwrap();
         // Foreign live kanshis (e.g. a developer session running the real
         // thing) make the other scenarios untestable, and must never be
         // stopped by this test.
@@ -1438,7 +1444,10 @@ mod tests {
 
         // A kanshi that reloads is running: it is asked to reload, nothing
         // is killed or started.
-        let mut reloading = Command::new(&reloading_bin).spawn().unwrap();
+        let mut reloading = Command::new(&reloading_bin)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         for _ in 0..100 {
             if reloads_on_sighup(reloading.id()) {
                 break;
@@ -1473,7 +1482,10 @@ mod tests {
         // signalled, and started again through the systemd unit.
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "0");
-        let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
+        let mut exiting = Command::new(&exiting_bin)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         wait_until_live(uid, exiting.id());
         assert!(!reloads_on_sighup(exiting.id()));
         assert_eq!(
@@ -1493,7 +1505,10 @@ mod tests {
         // The same without a systemd user session: stopped, then spawned.
         fs::remove_file(&log).unwrap();
         std::env::set_var("FAKE_SYSTEMCTL_RC", "1");
-        let mut exiting = Command::new(&exiting_bin).arg("60").spawn().unwrap();
+        let mut exiting = Command::new(&exiting_bin)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         wait_until_live(uid, exiting.id());
         assert_eq!(
             reload_or_start_kanshi(&config).unwrap(),

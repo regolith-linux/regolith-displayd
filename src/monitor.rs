@@ -156,40 +156,62 @@ impl Monitor {
     }
 }
 
-impl PartialEq for Monitor {
-    fn eq(&self, other: &Self) -> bool {
+impl Monitor {
+    /// The monitor's state, as the change detector compares it: the same
+    /// monitor (connector, vendor, product and serial) in the same mode.
+    /// Equality and hashing both use it, so that equal values also hash the
+    /// same, as `HashSet` requires. [`Monitor::same_monitor`] compares the
+    /// identity alone.
+    fn state(&self) -> (&(String, String, String, String), &str) {
+        (&self.description, self.get_current_mode())
+    }
+
+    /// Whether `other` is the same monitor, whatever its mode.
+    pub fn same_monitor(&self, other: &Monitor) -> bool {
         self.description == other.description
     }
 }
 
-impl PartialEq for LogicalMonitor {
+impl PartialEq for Monitor {
     fn eq(&self, other: &Self) -> bool {
-        self.x_pos == other.x_pos
-            && self.y_pos == other.y_pos
-            && self.scale == other.scale
-            && self.transform == other.transform
+        self.state() == other.state()
     }
 }
 
 impl Eq for Monitor {}
 
-impl Eq for LogicalMonitor {}
-
 impl Hash for Monitor {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.description.hash(state);
-        self.get_current_mode().hash(state);
+        self.state().hash(state);
     }
 }
 
+impl LogicalMonitor {
+    /// The logical monitor's state: where it is, its scale and rotation, and
+    /// the monitors it shows on. Equality and hashing both use it. The scale
+    /// is compared by its bits, so that equal values always hash the same.
+    fn state(&self) -> (i32, i32, u64, u32, &[(String, String, String, String)]) {
+        (
+            self.x_pos,
+            self.y_pos,
+            self.scale.to_bits(),
+            self.transform,
+            &self.monitors,
+        )
+    }
+}
+
+impl PartialEq for LogicalMonitor {
+    fn eq(&self, other: &Self) -> bool {
+        self.state() == other.state()
+    }
+}
+
+impl Eq for LogicalMonitor {}
+
 impl Hash for LogicalMonitor {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.y_pos.hash(state);
-        self.x_pos.hash(state);
-        self.transform.hash(state);
-        let scale_int = (self.scale * 1000f64) as u32;
-        scale_int.hash(state);
-        self.monitors[0].hash(state);
+        self.state().hash(state);
     }
 }
 
@@ -587,6 +609,77 @@ mod tests {
         assert_eq!(diagonal_to_str(13.3), "13.3\"");
         assert_eq!(diagonal_to_str(27.15), "27\"");
         assert_eq!(diagonal_to_str(23.5), "24\"");
+    }
+
+    fn hash_of<T: Hash>(value: &T) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// `name` at `x`, in the mode `width`x1080.
+    fn placed_output(name: &str, x: i32, width: i32) -> Output {
+        serde_json::from_value(serde_json::json!({
+            "id": 3, "name": name, "make": "Acme", "model": "M1", "serial": "1",
+            "active": true, "dpms": true, "primary": false, "scale": 1.0,
+            "transform": "normal",
+            "modes": [
+                {"width": 1920, "height": 1080, "refresh": 60000},
+                {"width": 1280, "height": 1080, "refresh": 60000}
+            ],
+            "current_mode": {"width": width, "height": 1080, "refresh": 60000},
+            "rect": {"x": x, "y": 0, "width": width, "height": 1080}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn equal_monitors_hash_the_same() {
+        let outputs = [
+            placed_output("DP-1", 0, 1920),
+            placed_output("DP-1", 0, 1280),
+            placed_output("DP-2", 0, 1920),
+            placed_output("DP-1", 1920, 1920),
+        ];
+        for a in &outputs {
+            for b in &outputs {
+                let (ma, mb) = (Monitor::new(a), Monitor::new(b));
+                if ma == mb {
+                    assert_eq!(hash_of(&ma), hash_of(&mb), "{ma:?} and {mb:?}");
+                }
+                let (la, lb) = (LogicalMonitor::new(a), LogicalMonitor::new(b));
+                if la == lb {
+                    assert_eq!(hash_of(&la), hash_of(&lb), "{la:?} and {lb:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_monitor_in_another_mode_is_another_state() {
+        let wide = Monitor::new(&placed_output("DP-1", 0, 1920));
+        let narrow = Monitor::new(&placed_output("DP-1", 0, 1280));
+        assert_ne!(wide, narrow);
+    }
+
+    #[test]
+    fn the_same_monitor_in_any_mode() {
+        let wide = Monitor::new(&placed_output("DP-1", 0, 1920));
+        assert!(wide.same_monitor(&Monitor::new(&placed_output("DP-1", 0, 1280))));
+        assert!(!wide.same_monitor(&Monitor::new(&placed_output("DP-2", 0, 1920))));
+    }
+
+    #[test]
+    fn another_monitor_in_the_same_place_is_another_logical_monitor() {
+        assert_ne!(
+            LogicalMonitor::new(&placed_output("DP-1", 0, 1920)),
+            LogicalMonitor::new(&placed_output("DP-2", 0, 1920))
+        );
+        assert_eq!(
+            LogicalMonitor::new(&placed_output("DP-1", 0, 1920)),
+            LogicalMonitor::new(&placed_output("DP-1", 0, 1920))
+        );
     }
 
     #[test]

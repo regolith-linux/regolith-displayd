@@ -459,7 +459,11 @@ impl DisplayManager {
     fn get_disabled_monitors(&self, active_physical_monitors: &[Monitor]) -> Vec<&Monitor> {
         self.monitors
             .iter()
-            .filter(|mon| !active_physical_monitors.contains(mon))
+            .filter(|mon| {
+                !active_physical_monitors
+                    .iter()
+                    .any(|active| active.same_monitor(mon))
+            })
             .collect()
     }
 
@@ -502,8 +506,8 @@ impl DisplayManager {
 
     /// Store `monitors` and `logical_monitors` if they differ from the current
     /// state, as sets: a monitor that was added, removed or changed mode, or a
-    /// logical monitor that was added, removed, moved, scaled or rotated.
-    /// Returns whether they did.
+    /// logical monitor that was added, removed, moved, scaled or rotated, or
+    /// that now shows another monitor. Returns whether they did.
     ///
     /// When monitors were plugged in or unplugged, the serial also moves on,
     /// so a configuration composed for the previous monitors is refused
@@ -533,7 +537,9 @@ fn same_set<T: Eq + Hash>(a: &[T], b: &[T]) -> bool {
 /// Whether `a` and `b` are the same monitors (connector, vendor, product and
 /// serial), whatever their modes.
 fn same_monitors(a: &[Monitor], b: &[Monitor]) -> bool {
-    a.len() == b.len() && a.iter().all(|monitor| b.contains(monitor))
+    a.len() == b.len()
+        && a.iter()
+            .all(|monitor| b.iter().any(|other| other.same_monitor(monitor)))
 }
 
 impl DisplayManagerProperties {
@@ -1691,6 +1697,35 @@ mod hotplug_tests {
             // The same monitors: a configuration for them is still valid.
             assert_eq!(manager.serial, 1);
         }
+    }
+
+    #[test]
+    fn a_mode_change_is_always_noticed() {
+        // Each HashSet hashes with new random keys. A monitor in another mode
+        // that compared equal but hashed differently was missed whenever the
+        // two hashes happened to match closely enough (about 1 in 128).
+        for _ in 0..1000 {
+            let mut manager = reported(&[dp1()]);
+            let (monitors, logical_monitors) = state(&[sway_output("DP-1", 0, 1.0, 1280)]);
+            assert!(manager.update(monitors, logical_monitors));
+            assert_eq!(manager.serial, 1);
+        }
+    }
+
+    #[test]
+    fn outputs_that_swap_places_are_a_change() {
+        let mut manager = reported(&[dp1(), dp2()]);
+        let (monitors, logical_monitors) = state(&[
+            sway_output("DP-1", 1920, 1.0, 1920),
+            sway_output("DP-2", 0, 1.0, 1920),
+        ]);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(manager.serial, 1);
+        let (monitors, logical_monitors) = state(&[
+            sway_output("DP-1", 1920, 1.0, 1920),
+            sway_output("DP-2", 0, 1.0, 1920),
+        ]);
+        assert!(!manager.update(monitors, logical_monitors));
     }
 }
 #[cfg(test)]

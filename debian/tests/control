@@ -1,5 +1,5 @@
 Tests: display-config-headless display-hotplug-headless
-Depends: @, dbus, kanshi, libglib2.0-bin, procps, python3, sway
+Depends: @, dbus, kanshi, libglib2.0-bin, procps, python3, sway, wtype
 Restrictions: allow-stderr, skippable
 
 Tests: session-units

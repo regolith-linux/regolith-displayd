@@ -41,4 +41,3 @@ async fn daemon() -> Result<(), Box<dyn Error>> {
     pending::<()>().await;
     Ok(())
 }
-

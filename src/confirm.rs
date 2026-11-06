@@ -240,10 +240,12 @@ impl Prompt {
             return;
         };
         let stride = WIDTH as i32 * 4;
-        let Ok((buffer, canvas)) =
-            self.pool
-                .create_buffer(WIDTH as i32, HEIGHT as i32, stride, wl_shm::Format::Argb8888)
-        else {
+        let Ok((buffer, canvas)) = self.pool.create_buffer(
+            WIDTH as i32,
+            HEIGHT as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+        ) else {
             return;
         };
         for (i, px) in canvas.chunks_exact_mut(4).enumerate() {
@@ -262,7 +264,11 @@ impl Prompt {
             (countdown.as_str(), 20.0, 66.0),
             ("Enter: Keep Changes      Esc: Revert Settings", 18.0, 106.0),
         ];
-        if let Some(font) = self.font.as_deref().and_then(|f| FontRef::try_from_slice(f).ok()) {
+        if let Some(font) = self
+            .font
+            .as_deref()
+            .and_then(|f| FontRef::try_from_slice(f).ok())
+        {
             for (text, size, top) in lines {
                 draw_text(canvas, &font, text, size, 20.0, top);
             }
@@ -302,11 +308,39 @@ fn draw_text(canvas: &mut [u8], font: &FontRef, text: &str, size: f32, left: f32
 }
 
 impl CompositorHandler for Prompt {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
-    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for Prompt {
@@ -324,7 +358,14 @@ impl LayerShellHandler for Prompt {
         self.done = true;
     }
 
-    fn configure(&mut self, conn: &Connection, qh: &QueueHandle<Self>, _: &LayerSurface, _: LayerSurfaceConfigure, _: u32) {
+    fn configure(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &LayerSurface,
+        _: LayerSurfaceConfigure,
+        _: u32,
+    ) {
         let first = !self.configured;
         self.configured = true;
         self.draw();
@@ -337,7 +378,14 @@ impl LayerShellHandler for Prompt {
 }
 
 impl Dispatch<wl_callback::WlCallback, ()> for Prompt {
-    fn event(state: &mut Self, _: &wl_callback::WlCallback, event: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let wl_callback::Event::Done { .. } = event {
             if !state.announced {
                 state.announced = true;
@@ -352,12 +400,24 @@ impl SeatHandler for Prompt {
         &mut self.seat_state
     }
     fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
         }
     }
-    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, capability: Capability) {
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
         if capability == Capability::Keyboard {
             if let Some(keyboard) = self.keyboard.take() {
                 keyboard.release();
@@ -368,15 +428,57 @@ impl SeatHandler for Prompt {
 }
 
 impl KeyboardHandler for Prompt {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
-    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+    }
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
         if let Some(answer) = answer_for_key(event.keysym) {
             self.answer(answer);
         }
     }
-    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
-    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: Modifiers, _: u32) {}
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: Modifiers,
+        _: u32,
+    ) {
+    }
 }
 
 impl ShmHandler for Prompt {
@@ -415,7 +517,10 @@ mod tests {
     #[test]
     fn answers_read_back() {
         for answer in [Answer::Keep, Answer::Revert] {
-            assert_eq!(Answer::from_line(&format!("{}\n", answer.word())), Some(answer));
+            assert_eq!(
+                Answer::from_line(&format!("{}\n", answer.word())),
+                Some(answer)
+            );
         }
         assert_eq!(Answer::from_line("ready"), None);
     }
@@ -427,7 +532,13 @@ mod tests {
         assert_eq!(seconds_shown(Duration::from_millis(19_000)), 19);
         assert_eq!(seconds_shown(Duration::from_millis(1)), 1);
         assert_eq!(seconds_shown(Duration::ZERO), 0);
-        assert_eq!(until_next_second(Duration::from_millis(19_250)), Duration::from_millis(250));
-        assert_eq!(until_next_second(Duration::from_millis(19_000)), Duration::from_millis(1000));
+        assert_eq!(
+            until_next_second(Duration::from_millis(19_250)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            until_next_second(Duration::from_millis(19_000)),
+            Duration::from_millis(1000)
+        );
     }
 }

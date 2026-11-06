@@ -287,7 +287,7 @@ impl DisplayServer {
     #[dbus_interface(property)]
     pub async fn apply_monitors_config_allowed(&self) -> bool {
         info!("Call to apply_monitors_config");
-        return true;
+        true
     }
 
     #[dbus_interface(signal)]
@@ -554,7 +554,7 @@ impl DisplayManager {
     }
 
     /// Returns list of all monitors and logical monitors
-    pub async fn get_monitor_info<'a>(
+    pub async fn get_monitor_info(
         &mut self,
         sway_connection: &Mutex<Connection>,
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
@@ -569,11 +569,11 @@ impl DisplayManager {
     /// The monitors of sway's `outputs`, and the logical monitors of the
     /// active ones.
     fn monitors_of(outputs: &[Output]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
-        let monitors = outputs.iter().map(|o| Monitor::new(o)).collect();
+        let monitors = outputs.iter().map(Monitor::new).collect();
         let logical_monitors = outputs
             .iter()
             .filter(|o| o.active)
-            .map(|o| LogicalMonitor::new(o))
+            .map(LogicalMonitor::new)
             .collect();
         (monitors, logical_monitors)
     }
@@ -616,6 +616,12 @@ fn same_monitors(a: &[Monitor], b: &[Monitor]) -> bool {
             .all(|monitor| b.iter().any(|other| other.same_monitor(monitor)))
 }
 
+impl Default for DisplayManagerProperties {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DisplayManagerProperties {
     pub fn new() -> DisplayManagerProperties {
         DisplayManagerProperties {
@@ -653,13 +659,7 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
     let home_dir = env_vars.get("HOME").expect("$HOME not defined");
     let default_path = format!("{home_dir}/.config/regolith3/kanshi");
     let base: PathBuf = match trawlcat::rescat("kanshi.path", Some(default_path.clone())).await {
-        Ok(path) => match path.try_into() {
-            Ok(path_buf) => path_buf,
-            Err(e) => {
-                warn!("Error: {e}");
-                default_path.into()
-            }
-        },
+        Ok(path) => path.into(),
         Err(e) => {
             warn!("Error: {e}");
             default_path.into()
@@ -667,7 +667,7 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
     };
     let profiles = base.join("profiles");
     let config = base.join("config");
-    return Ok(KanshiPaths { profiles, config });
+    Ok(KanshiPaths { profiles, config })
 }
 
 /// The output that a profile in this kanshi configuration names twice, if any.
@@ -758,7 +758,7 @@ fn monitor_set(monitors: &[Monitor]) -> Vec<String> {
 /// logical monitors, logical monitors not all connected by shared edges, a
 /// layout that doesn't start at (0, 0), or not exactly one primary.
 /// Each logical monitor has already passed [`MonitorApply::verify`].
-fn verify_layout(config: &[MonitorApply], monitors: &Vec<Monitor>) -> zbus::fdo::Result<()> {
+fn verify_layout(config: &[MonitorApply], monitors: &[Monitor]) -> zbus::fdo::Result<()> {
     let invalid = |message: &str| Err(zbus::fdo::Error::InvalidArgs(message.to_string()));
     if config.is_empty() {
         return invalid("Monitors config incomplete");
@@ -1267,7 +1267,7 @@ mod tests {
             vec![acme("DP-1"), acme("DP-2")],
             &[place("DP-1", 0), place("DP-2", 1920)],
         );
-        fs::write(paths.profiles.join(&name), &contents).unwrap();
+        fs::write(paths.profiles.join(name), contents).unwrap();
         fs::write(
             paths.profiles.join("Acme_View_24_0__Acme_View_24_0"),
             OLD_IDENTICAL_PROFILE,

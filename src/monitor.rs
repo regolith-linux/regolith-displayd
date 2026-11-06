@@ -203,11 +203,15 @@ impl Hash for Monitor {
     }
 }
 
+/// What `LogicalMonitor::state` returns: x, y, scale bits, transform and the
+/// monitors shown.
+type LogicalMonitorState<'a> = (i32, i32, u64, u32, &'a [(String, String, String, String)]);
+
 impl LogicalMonitor {
     /// The logical monitor's state: where it is, its scale and rotation, and
     /// the monitors it shows on. Equality and hashing both use it. The scale
     /// is compared by its bits, so that equal values always hash the same.
-    fn state(&self) -> (i32, i32, u64, u32, &[(String, String, String, String)]) {
+    fn state(&self) -> LogicalMonitorState<'_> {
         (
             self.x_pos,
             self.y_pos,
@@ -397,13 +401,12 @@ impl LogicalMonitor {
 impl MonitorApply {
     fn get_modestr(&self, monitor: &Monitor) -> Option<String> {
         let modestr = &self.monitors[0].1;
-        match monitor.search_modes(&modestr) {
-            Some(x) => Some(x.get_modestr().to_string()),
-            None => None,
-        }
+        monitor
+            .search_modes(modestr)
+            .map(|x| x.get_modestr().to_string())
     }
 
-    pub fn search_monitor<'a>(&self, monitors: &'a Vec<Monitor>) -> Option<&'a Monitor> {
+    pub fn search_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
         monitors
             .iter()
             .find(|mon| mon.description.0 == self.monitors[0].0)
@@ -411,7 +414,7 @@ impl MonitorApply {
 
     pub fn search_logical_monitor<'a>(
         &self,
-        logical_monitors: &'a Vec<LogicalMonitor>,
+        logical_monitors: &'a [LogicalMonitor],
     ) -> Option<&'a LogicalMonitor> {
         logical_monitors
             .iter()
@@ -420,7 +423,7 @@ impl MonitorApply {
 
     pub fn save_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor, connected: &[Monitor]) {
         let dpy_name = monitor.kanshi_name(connected);
-        let mode = match self.get_modestr(&monitor) {
+        let mode = match self.get_modestr(monitor) {
             Some(x) => x,
             _ => return,
         };
@@ -458,8 +461,8 @@ impl MonitorApply {
     pub fn verify(
         &self,
         _sway_connect: &Arc<Mutex<Connection>>,
-        monitors: &Vec<Monitor>,
-        logical_monitors: &Vec<LogicalMonitor>,
+        monitors: &[Monitor],
+        logical_monitors: &[LogicalMonitor],
     ) -> zbus::fdo::Result<()> {
         if self.monitors.is_empty() {
             return Err(ZError::InvalidArgs(String::from("Logical monitor is empty")));
@@ -476,7 +479,7 @@ impl MonitorApply {
             .ok_or(Failed(String::from("Monitor not found")))?;
 
         // Check if position is valid
-        if self.get_modestr(monitor) == None {
+        if self.get_modestr(monitor).is_none() {
             return Err(ZError::InvalidArgs(String::from("Invalid position")));
         }
 
@@ -493,7 +496,7 @@ impl MonitorApply {
         let unchanged_scale = mode.current()
             && self
                 .search_logical_monitor(logical_monitors)
-                .map_or(false, |current| (current.scale - self.scale).abs() < 1e-6);
+                .is_some_and(|current| (current.scale - self.scale).abs() < 1e-6);
         if !mode.is_valid_scale(self.scale) && !unchanged_scale {
             return Err(ZError::InvalidArgs(format!(
                 "Scale {} not valid for resolution {}x{}",
@@ -503,7 +506,7 @@ impl MonitorApply {
             )));
         }
 
-        if MonitorTransform::from_u32(self.transform) == None {
+        if MonitorTransform::from_u32(self.transform).is_none() {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
         }
         Ok(())
@@ -524,7 +527,7 @@ impl MonitorApply {
     /// The size of this logical monitor in the layout, in logical pixels: the
     /// mode, turned for a 90 or 270 degree transform, divided by the scale.
     /// Call it once [`MonitorApply::verify`] has accepted the monitor.
-    pub fn logical_size(&self, monitors: &Vec<Monitor>) -> (i32, i32) {
+    pub fn logical_size(&self, monitors: &[Monitor]) -> (i32, i32) {
         let Some(mode) = self
             .search_monitor(monitors)
             .and_then(|monitor| monitor.search_modes(&self.monitors[0].1))

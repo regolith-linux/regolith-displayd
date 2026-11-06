@@ -28,9 +28,7 @@ pub fn physical_size_mm_in(drm: &Path, connector: &str) -> Option<(i32, i32)> {
             let name = name.to_string_lossy();
             name.strip_suffix(&suffix)
                 .and_then(|card| card.strip_prefix("card"))
-                .map_or(false, |n| {
-                    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
-                })
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         })
         .filter_map(|entry| fs::read(entry.path().join("edid")).ok())
         .find_map(|edid| size_from_edid(&edid))

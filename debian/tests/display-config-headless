@@ -121,6 +121,26 @@ profile_files() {
     ls "$profiles"
 }
 
+# started_kanshi: regolith-displayd has started a kanshi since the log counted
+# $starts_before starts. Sets $spawned to its pid, or to "(already exited)".
+started_kanshi() {
+    local starts
+    # Count first: a kanshi started before the count is already a child when
+    # ps looks for it below.
+    starts=$(grep -cE "kanshi reload: (Spawned|StartedService)" "$work/displayd.log" || true)
+    # ps fails when regolith-displayd has no child at all, which set -e would
+    # turn into a silent exit.
+    spawned=$({ ps --ppid "$displayd" -o pid=,stat=,comm= || true; } | awk '$3 == "kanshi" && $2 !~ /^Z/ {print $1}')
+    [ -n "$spawned" ] && return 0
+    # kanshi 1.2 (jammy) cannot apply a profile to a headless output and may
+    # exit right after it starts; regolith-displayd did start it.
+    if [ "$scale_checks" = no ] && [ "$starts" -gt "$starts_before" ]; then
+        spawned="(already exited)"
+        return 0
+    fi
+    return 1
+}
+
 printf 'xwayland disable\noutput HEADLESS-1 mode 1600x1000\n' > "$work/sway.cfg"
 sway -c "$work/sway.cfg" > "$work/sway.log" 2>&1 &
 pids+=($!)
@@ -270,15 +290,20 @@ if ! systemctl --user show-environment > /dev/null 2>&1; then
         echo "note: kanshi had already exited; regolith-displayd log: $(tail -n 20 "$work/displayd.log" | tr '\n' ' ')"
     fi
     retry 20 live_kanshis_are $((kanshis - 1)) || fail "kanshi $old did not stop"
+    starts_before=$(grep -cE "kanshi reload: (Spawned|StartedService)" "$work/displayd.log" || true)
     apply 2 1.0 "$mode" > /dev/null || fail "Apply with no kanshi running failed"
     keep || fail "could not keep the Apply with no kanshi running"
     retry 20 saved_scale 1 || fail "the Apply with no kanshi running was not saved once kept"
     if [ "$scale_checks" = yes ]; then
         retry 40 sway_scale_is 1.0 || fail "scale 1 did not take effect with no kanshi running"
     fi
-    spawned=$(ps --ppid "$displayd" -o pid=,stat=,comm= | awk '$3 == "kanshi" && $2 !~ /^Z/ {print $1}')
-    [ -n "$spawned" ] || fail "regolith-displayd did not start kanshi"
-    retry 20 live_kanshis_are "$kanshis" || fail "live kanshi count changed: $kanshis -> $(live_kanshis)"
+    # The profile is written before kanshi is started: without a systemd user
+    # manager, regolith-displayd first waits for systemctl to fail, so wait
+    # for the kanshi it starts.
+    retry 20 started_kanshi || fail "regolith-displayd did not start kanshi"
+    if [ "$spawned" != "(already exited)" ]; then
+        retry 20 live_kanshis_are "$kanshis" || fail "live kanshi count changed: $kanshis -> $(live_kanshis)"
+    fi
     [ "$(zombie_children)" = 0 ] || fail "regolith-displayd left zombie children"
     echo "ok: with no kanshi running, Apply started kanshi $spawned$([ "$scale_checks" = yes ] && echo " and the scale took effect")"
 fi

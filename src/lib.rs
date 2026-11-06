@@ -1096,7 +1096,6 @@ fn reload_or_start_kanshi(config: &Path) -> std::io::Result<KanshiReload> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
 
     /// Children of this process that are zombies named `name`.
@@ -1132,13 +1131,31 @@ mod tests {
     }
 
     fn fake_tool(dir: &Path, name: &str, body: &str) {
-        let path = dir.join(name);
-        fs::write(
-            &path,
-            format!("#!/bin/sh\necho \"{name} $*\" >> \"$FAKE_LOG\"\n{body}\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(
+            &dir.join(name),
+            &format!("#!/bin/sh\necho \"{name} $*\" >> \"$FAKE_LOG\"\n{body}\n"),
+        );
+    }
+
+    /// Create an executable script that the tests then run. Other tests
+    /// spawn processes at the same time, and a child forked while this
+    /// process has the script open for writing keeps that descriptor until
+    /// it execs; running the script in that window fails with "Text file
+    /// busy" (ETXTBSY). So this process never opens the script for writing:
+    /// the text goes to a side file, and `install`, a separate process,
+    /// creates the executable from it.
+    fn write_script(path: &Path, contents: &str) {
+        let text = path.with_extension("text");
+        fs::write(&text, contents).unwrap();
+        let status = Command::new("install")
+            .arg("-m")
+            .arg("755")
+            .arg(&text)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "install {} failed", path.display());
+        fs::remove_file(&text).unwrap();
     }
 
     fn monitor(connector: &str, make: &str, model: &str, serial: &str) -> Monitor {
@@ -1524,14 +1541,11 @@ mod tests {
         let exiting_bin = dir.join("exiting").join("kanshi");
         fs::create_dir_all(reloading_bin.parent().unwrap()).unwrap();
         fs::create_dir_all(exiting_bin.parent().unwrap()).unwrap();
-        fs::write(
+        write_script(
             &reloading_bin,
             "#!/bin/sh\ntrap : HUP\nwhile :; do read -r _; done\n",
-        )
-        .unwrap();
-        fs::set_permissions(&reloading_bin, fs::Permissions::from_mode(0o755)).unwrap();
-        fs::write(&exiting_bin, "#!/bin/sh\nread -r _\n").unwrap();
-        fs::set_permissions(&exiting_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        );
+        write_script(&exiting_bin, "#!/bin/sh\nread -r _\n");
         // Foreign live kanshis (e.g. a developer session running the real
         // thing) make the other scenarios untestable, and must never be
         // stopped by this test.

@@ -462,7 +462,9 @@ impl MonitorApply {
         logical_monitors: &Vec<LogicalMonitor>,
     ) -> zbus::fdo::Result<()> {
         if self.monitors.is_empty() {
-            return Err(ZError::InvalidArgs(String::from("Logical monitor is empty")));
+            return Err(ZError::InvalidArgs(String::from(
+                "Logical monitor is empty",
+            )));
         }
         // sway shows each output on its own: it cannot mirror one logical
         // monitor on several monitors.
@@ -733,7 +735,11 @@ mod tests {
             scale: 1.5,
             transform,
             primary: false,
-            monitors: vec![("HEADLESS-1".into(), mode.into(), MonitorProperties::new(&output("[]")))],
+            monitors: vec![(
+                "HEADLESS-1".into(),
+                mode.into(),
+                MonitorProperties::new(&output("[]")),
+            )],
         };
         assert_eq!(
             apply("1920x1080@59.951Hz", 1).sway_command(&monitor).as_deref(),

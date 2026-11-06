@@ -172,7 +172,9 @@ impl DisplayServer {
         }
         if method > 2 {
             error!("Invalid configuration recieved for method apply_monitors_config: Invalid method {method}");
-            return Err(zbus::fdo::Error::InvalidArgs(String::from("Invalid method")));
+            return Err(zbus::fdo::Error::InvalidArgs(String::from(
+                "Invalid method",
+            )));
         }
         // Only the logical layout mode is implemented. The request's
         // properties are options for this request: they never replace the
@@ -231,7 +233,10 @@ impl DisplayServer {
             }
             return Err(zbus::fdo::Error::Failed(e));
         }
-        info!("Applied configuration (method {method}): {}", commands.join("; "));
+        info!(
+            "Applied configuration (method {method}): {}",
+            commands.join("; ")
+        );
         // This change replaces the one awaiting an answer, if any.
         if PENDING.lock().await.take().is_some() {
             info!("A newer configuration replaces the one awaiting confirmation");
@@ -277,7 +282,10 @@ impl DisplayServer {
         // Reply once the prompt can take the answer: the caller may press
         // Enter as soon as the call returns.
         if let Some(ready) = ready {
-            if tokio::time::timeout(PROMPT_READY_TIMEOUT, ready).await.is_err() {
+            if tokio::time::timeout(PROMPT_READY_TIMEOUT, ready)
+                .await
+                .is_err()
+            {
                 warn!("The confirmation prompt is not on screen yet");
             }
         }
@@ -467,7 +475,9 @@ impl DisplayManager {
         let profile = fs::read_to_string(paths.profiles.join(profile_name)).ok()?;
         let name = profile.lines().find_map(|line| {
             let rest = line.trim().strip_prefix(PRIMARY_OUTPUT)?.trim();
-            rest.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
+            rest.strip_prefix('"')?
+                .strip_suffix('"')
+                .map(str::to_string)
         })?;
         self.monitors
             .iter()
@@ -492,10 +502,12 @@ impl DisplayManager {
             .and_then(|chosen| active.iter().find(|monitor| monitor.connector() == chosen))
             .or_else(|| active.iter().find(|monitor| monitor.is_builtin()))
             .or_else(|| {
-                active.iter().fold(None, |best: Option<&&Monitor>, monitor| match best {
-                    Some(b) if b.current_area() >= monitor.current_area() => Some(b),
-                    _ => Some(monitor),
-                })
+                active
+                    .iter()
+                    .fold(None, |best: Option<&&Monitor>, monitor| match best {
+                        Some(b) if b.current_area() >= monitor.current_area() => Some(b),
+                        _ => Some(monitor),
+                    })
             })
             .map(|monitor| monitor.connector().to_string());
         for logical in &mut self.logical_monitors {
@@ -1863,11 +1875,23 @@ mod layout_tests {
     #[test]
     fn valid_layouts_are_accepted() {
         check(&[logical(0, 0, 1.0, 0, &["DP-1"])]).unwrap();
-        check(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1920, 0, 1.0, 0, &["DP-2"])]).unwrap();
+        check(&[
+            logical(0, 0, 1.0, 0, &["DP-1"]),
+            logical(1920, 0, 1.0, 0, &["DP-2"]),
+        ])
+        .unwrap();
         // Stacked, with only part of an edge shared.
-        check(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(960, 1080, 1.0, 0, &["DP-2"])]).unwrap();
+        check(&[
+            logical(0, 0, 1.0, 0, &["DP-1"]),
+            logical(960, 1080, 1.0, 0, &["DP-2"]),
+        ])
+        .unwrap();
         // Scaled and rotated: 960x540 and 1080x1920 logical pixels.
-        check(&[logical(0, 0, 2.0, 0, &["DP-1"]), logical(960, 0, 1.0, 1, &["DP-2"])]).unwrap();
+        check(&[
+            logical(0, 0, 2.0, 0, &["DP-1"]),
+            logical(960, 0, 1.0, 1, &["DP-2"]),
+        ])
+        .unwrap();
     }
 
     #[test]
@@ -1877,12 +1901,42 @@ mod layout_tests {
             assert!(error.contains(why), "{error} does not say {why}");
         };
         refused(&[], "incomplete");
-        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1920, 0, 1.0, 0, &["DP-1"])], "twice");
-        refused(&[logical(-1920, 0, 1.0, 0, &["DP-1"]), logical(0, 0, 1.0, 0, &["DP-2"])], "position");
-        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1000, 0, 1.0, 0, &["DP-2"])], "overlap");
-        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(2000, 0, 1.0, 0, &["DP-2"])], "adjacent");
+        refused(
+            &[
+                logical(0, 0, 1.0, 0, &["DP-1"]),
+                logical(1920, 0, 1.0, 0, &["DP-1"]),
+            ],
+            "twice",
+        );
+        refused(
+            &[
+                logical(-1920, 0, 1.0, 0, &["DP-1"]),
+                logical(0, 0, 1.0, 0, &["DP-2"]),
+            ],
+            "position",
+        );
+        refused(
+            &[
+                logical(0, 0, 1.0, 0, &["DP-1"]),
+                logical(1000, 0, 1.0, 0, &["DP-2"]),
+            ],
+            "overlap",
+        );
+        refused(
+            &[
+                logical(0, 0, 1.0, 0, &["DP-1"]),
+                logical(2000, 0, 1.0, 0, &["DP-2"]),
+            ],
+            "adjacent",
+        );
         // Touching only at a corner.
-        refused(&[logical(0, 0, 1.0, 0, &["DP-1"]), logical(1920, 1080, 1.0, 0, &["DP-2"])], "adjacent");
+        refused(
+            &[
+                logical(0, 0, 1.0, 0, &["DP-1"]),
+                logical(1920, 1080, 1.0, 0, &["DP-2"]),
+            ],
+            "adjacent",
+        );
         refused(&[logical(100, 0, 1.0, 0, &["DP-1"])], "offset");
     }
 
@@ -1929,8 +1983,14 @@ mod layout_tests {
         assert_eq!(reported_primary(&outputs, None), "eDP-1");
         assert_eq!(reported_primary(&outputs, Some("HDMI-1")), "eDP-1");
         // No laptop panel: the largest mode, the first of them on a tie.
-        assert_eq!(reported_primary(&[("DP-1", 1920), ("DP-2", 2560)], None), "DP-2");
-        assert_eq!(reported_primary(&[("DP-1", 1920), ("DP-2", 1920)], None), "DP-1");
+        assert_eq!(
+            reported_primary(&[("DP-1", 1920), ("DP-2", 2560)], None),
+            "DP-2"
+        );
+        assert_eq!(
+            reported_primary(&[("DP-1", 1920), ("DP-2", 1920)], None),
+            "DP-1"
+        );
     }
 
     #[test]

@@ -1026,6 +1026,7 @@ dependencies = [
  "num-derive",
  "num-traits",
  "pretty_env_logger",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "smithay-client-toolkit",
@@ -1033,6 +1034,8 @@ dependencies = [
  "tokio",
  "trawlcat",
  "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "zbus",
  "zvariant",
 ]

@@ -1,3 +1,27 @@
+regolith-displayd (0.4.0) jammy; urgency=medium
+
+  [ rego-port-bot ]
+  * fix: keep regolith-displayd running when kanshi restarts
+  * test: add an autopkgtest for the displayd and kanshi user units
+  * test: wait for the fake kanshi to be running before reloading
+  * fix: name monitors like Mutter and stop reporting pixels as millimetres
+  * fix: tell identical monitors apart in kanshi profiles
+  * fix: refuse display configurations made for other monitors
+  * fix: keep connector-named kanshi profiles to the monitors they were saved for
+  * fix: offer the scales Mutter offers for each mode
+  * fix: refuse display configurations that Mutter refuses
+  * fix: keep the advertised display properties across Apply
+  * fix: don't save temporary display changes
+  * fix: report and remember the primary display
+  * feat: ask to keep display changes, and revert them after 20 seconds
+  * test: don't let display-config-headless exit silently
+  * fix: compare and hash monitors by the same fields
+
+  [ Carlos Fernandez Sanz ]
+  * fix(tests): make the exiting fake kanshi a script, not a copy of sleep
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Thu, 05 Nov 2026 15:34:02 -0800
+
 regolith-displayd (0.3.5) jammy; urgency=medium
 
   [ rego-port-bot ]

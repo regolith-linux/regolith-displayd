@@ -112,7 +112,7 @@ impl Monitor {
         if !self.modes.is_empty() {
             return;
         }
-        if let Some(previous) = known.iter().find(|monitor| *monitor == self) {
+        if let Some(previous) = known.iter().find(|monitor| monitor.same_monitor(self)) {
             self.modes = previous
                 .modes
                 .iter()

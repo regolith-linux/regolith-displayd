@@ -1,3 +1,14 @@
+regolith-displayd (0.5.0) jammy; urgency=medium
+
+  [ rego-port-bot ]
+  * style: apply cargo fmt
+  * fix: address clippy warnings
+  * feat: show monitor number labels for Settings > Displays in sway
+  * fix(tests): don't exit silently when kanshi has already exited in display-config-headless
+  * ci: check formatting, clippy and tests on every pull request
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 07 Nov 2026 09:11:07 -0800
+
 regolith-displayd (0.4.0) jammy; urgency=medium
 
   [ rego-port-bot ]

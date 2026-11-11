@@ -1,0 +1,149 @@
+#!/bin/bash
+# regolith-displayd-init must create a kanshi configuration that the installed
+# kanshi reads, whatever the home directory is called: plain, with spaces,
+# with double or single quotes, backslashes or shell syntax in it. For each
+# home, check that the initializer succeeds and is idempotent, that kanshi
+# parses the configuration it wrote, and, on a headless sway, that kanshi
+# applies a profile from the profiles directory that it includes. An unquoted
+# configuration written by earlier versions for such a home must be replaced.
+set -euo pipefail
+
+work=$(mktemp -d)
+export HOME="$work/sway-home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+unset WAYLAND_DISPLAY SWAYSOCK DISPLAY DBUS_SESSION_BUS_ADDRESS REGOLITH_KANSHI_DIR
+pids=()
+
+cleanup() {
+    kill "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*"
+    for log in "$work"/*.log; do
+        echo "--- $log"
+        tail -n 40 "$log"
+    done
+    exit 1
+}
+
+# retry <tries, 0.5 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+sway_scale_is() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+out = next(o for o in json.load(sys.stdin) if o["name"] == "HEADLESS-1")
+sys.exit(out["scale"] != float(sys.argv[1]))' "$1"
+}
+
+# kanshi before 1.6 reads the include line raw and cannot take a path with a
+# single quote in the form that kanshi 1.6 and later need.
+old_kanshi=no
+if dpkg --compare-versions "$(dpkg-query -W -f '${Version}' kanshi)" lt 1.6; then
+    old_kanshi=yes
+fi
+
+# The last home holds shell syntax that must stay literal.
+# shellcheck disable=SC2016
+homes=(
+    "home"
+    "home with spaces"
+    'home "quoted"'
+    "home's"
+    "it's \"all\" \\ [of] them"
+    'back\slash $HOME `true` {x} [x] * ? ; | & ( )'
+)
+
+# check_home <home>: run the initializer for <home> and check the result.
+check_home() {
+    local home="$work/homes/$1" config profiles out
+    config="$home/.config/regolith3/kanshi/config"
+    profiles="$home/.config/regolith3/kanshi/profiles"
+    mkdir -p "$home"
+
+    HOME="$home" regolith-displayd-init > "$work/init.log" 2>&1 \
+        || fail "[$1] regolith-displayd-init failed"
+    [ -f "$config" ] || fail "[$1] no kanshi configuration was created"
+    [ -f "$profiles/dummy" ] || fail "[$1] no placeholder profile was created"
+    echo "[$1] $(cat "$config")"
+
+    cp "$config" "$work/config.first"
+    out=$(HOME="$home" regolith-displayd-init) || fail "[$1] the second run failed"
+    [ "$out" = "FOUND 1 profiles" ] || fail "[$1] the second run printed: $out"
+    cmp -s "$config" "$work/config.first" || fail "[$1] the second run changed the configuration"
+
+    if [ "$old_kanshi" = yes ] && [[ $1 == *"'"* ]]; then
+        echo "[$1] note: kanshi $(dpkg-query -W -f '${Version}' kanshi) cannot include a path with a single quote, kanshi checks skipped"
+        return
+    fi
+
+    # kanshi reads its configuration before it connects to the compositor.
+    WAYLAND_DISPLAY=no-such-display kanshi -c "$config" > "$work/parse.log" 2>&1 || true
+    if grep -qE 'parse|Could not|expected|scfg|unknown directive|unterminated' "$work/parse.log"; then
+        fail "[$1] kanshi cannot read the configuration: $(tr '\n' ' ' < "$work/parse.log")"
+    fi
+    grep -q 'failed to connect to display' "$work/parse.log" \
+        || fail "[$1] kanshi did not get past its configuration: $(tr '\n' ' ' < "$work/parse.log")"
+
+    if [ "$scale_checks" = yes ]; then
+        printf 'profile headless {\n\toutput HEADLESS-1 scale 2\n}\n' > "$profiles/headless"
+        kanshi -c "$config" > "$work/kanshi.log" 2>&1 &
+        local kanshi=$!
+        retry 20 sway_scale_is 2 || fail "[$1] kanshi did not apply the included profile"
+        kill "$kanshi"
+        wait "$kanshi" 2> /dev/null || true
+        swaymsg -q output HEADLESS-1 scale 1
+    fi
+}
+
+printf 'xwayland disable\noutput HEADLESS-1 mode 1280x800\n' > "$work/sway.cfg"
+sway -c "$work/sway.cfg" > "$work/sway.log" 2>&1 &
+pids+=($!)
+retry 60 compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" > /dev/null || fail "sway did not start"
+SWAYSOCK=$(compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" | head -n 1)
+export SWAYSOCK
+retry 20 swaymsg -t get_outputs > /dev/null || fail "sway IPC not ready"
+WAYLAND_DISPLAY=$(compgen -G "$XDG_RUNTIME_DIR/wayland-*" | grep -v '\.lock$' | head -n 1)
+WAYLAND_DISPLAY=${WAYLAND_DISPLAY##*/}
+[ -n "$WAYLAND_DISPLAY" ] || fail "sway created no wayland socket"
+export WAYLAND_DISPLAY
+
+# sway 1.7 with kanshi 1.2 (Ubuntu jammy) cannot apply any profile to a
+# headless output. Check that kanshi can before relying on the scale.
+printf 'profile {\n\toutput HEADLESS-1 scale 2\n}\n' > "$work/probe.cfg"
+kanshi -c "$work/probe.cfg" > "$work/probe.log" 2>&1 &
+probe=$!
+scale_checks=yes
+retry 20 sway_scale_is 2 || scale_checks=no
+kill "$probe"
+wait "$probe" 2> /dev/null || true
+swaymsg -q output HEADLESS-1 scale 1
+if [ "$scale_checks" = no ]; then
+    echo "note: kanshi cannot apply a profile to the headless output here, scale checks skipped: $(tr '\n' ' ' < "$work/probe.log")"
+fi
+
+for home in "${homes[@]}"; do
+    check_home "$home"
+done
+
+# An unquoted configuration that an earlier version wrote is replaced.
+legacy="$work/homes/legacy home"
+mkdir -p "$legacy/.config/regolith3/kanshi"
+echo "include $legacy/.config/regolith3/kanshi/profiles/*" > "$legacy/.config/regolith3/kanshi/config"
+check_home "legacy home"
+
+echo "PASS"

@@ -363,16 +363,15 @@ impl DisplayManager {
     /// Follow sway's outputs: every 700 ms, store them if they changed (see
     /// [`DisplayManager::update`]), tell the Displays panel, and hold back or
     /// restore the profiles kept to particular monitors.
+    ///
+    /// Returns only on an error, such as the sway IPC connection breaking.
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
     ) -> Result<(), Box<dyn Error>> {
         loop {
             let mut manager_obj_lock = manager_obj.lock().await;
-            let display_info = manager_obj_lock
-                .get_monitor_info(&sway_connection)
-                .await
-                .unwrap();
+            let display_info = manager_obj_lock.get_monitor_info(&sway_connection).await?;
             // A monitor that went away is a change too.
             let changed = manager_obj_lock.update(display_info.0.clone(), display_info.1.clone());
             if changed {

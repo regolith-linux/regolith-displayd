@@ -2,6 +2,10 @@ Tests: display-config-headless display-hotplug-headless
 Depends: @, dbus, kanshi, libglib2.0-bin, procps, python3, sway, wtype
 Restrictions: allow-stderr, skippable
 
+Tests: sway-restart-headless
+Depends: @, dbus, libglib2.0-bin, procps, sway
+Restrictions: allow-stderr
+
 Tests: init-paths
 Depends: @, kanshi, python3, sway
 Restrictions: allow-stderr

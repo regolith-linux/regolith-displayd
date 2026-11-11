@@ -7,19 +7,76 @@ DEFAULT_KANSHI_DIR="$HOME/.config/regolith3/kanshi"
 KANSHI_DIR=${REGOLITH_KANSHI_DIR:-"$DEFAULT_KANSHI_DIR"}
 PROFILES_DIR="$KANSHI_DIR/profiles"
 
+# Print the kanshi "include" directive that loads every file in directory $1.
+#
+# kanshi expands the include path with wordexp(3), like a shell word, so the
+# directory is quoted for the shell and only the trailing "*" is left to glob.
+# glibc's wordexp() then passes the whole word, quoted part included, to
+# glob(): the characters that glob() reads as a pattern are escaped first.
+# kanshi 1.6 and later read the line with scfg syntax, where a quoted argument
+# may hold spaces and, between double quotes, backslash escapes; older kanshi
+# passes the raw rest of the line on, after stripping the quotes around a first
+# quoted word. Single quotes around the whole argument mean the same to both,
+# so they are used unless the path itself holds a single quote.
+kanshi_include() {
+	local dir=$1 bs=\\ pattern quoted
+	case $dir in
+	*$'\n'*)
+		echo "regolith-displayd-init: kanshi cannot include a path that contains a newline: $dir" >&2
+		return 1
+		;;
+	*[!A-Za-z0-9_./+,:@%=-]*) ;;
+	*)
+		# Nothing to quote: the form that earlier versions wrote.
+		printf 'include %s/*\n' "$dir"
+		return
+		;;
+	esac
+
+	pattern=${dir//"$bs"/"$bs$bs"}
+	pattern=${pattern//'*'/"$bs*"}
+	pattern=${pattern//'?'/"$bs?"}
+	pattern=${pattern//'['/"${bs}["}
+
+	if [[ $dir != *"'"* ]]; then
+		# Shell double quotes inside scfg single quotes, which take
+		# backslashes literally.
+		quoted=${pattern//"$bs"/"$bs$bs"}
+		quoted=${quoted//'"'/"$bs\""}
+		quoted=${quoted//'$'/"$bs\$"}
+		quoted=${quoted//'`'/"$bs\`"}
+		printf "include '\"%s\"/*'\n" "$quoted"
+	else
+		# Shell single quotes inside scfg double quotes, escaped for scfg.
+		# kanshi before 1.6 cannot read this form.
+		quoted="'${pattern//"'"/"'$bs''"}'/*"
+		quoted=${quoted//"$bs"/"$bs$bs"}
+		quoted=${quoted//'"'/"$bs\""}
+		printf 'include "%s"\n' "$quoted"
+	fi
+}
+
 mkdir -p "$PROFILES_DIR"
 
-# create config file if doesn't already exist
-if [ ! -f $KANSHI_DIR/config ]; then
-	echo "include $PROFILES_DIR/*" > "$KANSHI_DIR/config"
+# create config file if doesn't already exist, or replace the unquoted one
+# that earlier versions wrote for a directory that needs quoting: kanshi
+# cannot read it
+CONFIG="$KANSHI_DIR/config"
+INCLUDE=$(kanshi_include "$PROFILES_DIR")
+UNQUOTED_INCLUDE="include $PROFILES_DIR/*"
+if [ ! -f "$CONFIG" ] ||
+	{ [ "$INCLUDE" != "$UNQUOTED_INCLUDE" ] && [ "$(cat "$CONFIG")" = "$UNQUOTED_INCLUDE" ]; }; then
+	printf '%s\n' "$INCLUDE" > "$CONFIG"
 fi
 
-PROFILES_COUNT=$(ls $PROFILES_DIR | wc -l)
+shopt -s nullglob
+PROFILES=("$PROFILES_DIR"/*)
+PROFILES_COUNT=${#PROFILES[@]}
 
-# Create dummy profile file if profiles_dir is empty 
+# Create dummy profile file if profiles_dir is empty
 # to avoid kanshi's file not found error
 if [ "$PROFILES_COUNT" == "0" ]; then
 	echo "profile {}" > "$PROFILES_DIR/dummy"
 else
-	echo "FOUND $PROFILES_COUNT profiles" 
+	echo "FOUND $PROFILES_COUNT profiles"
 fi

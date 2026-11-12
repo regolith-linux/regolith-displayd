@@ -7,19 +7,34 @@ DEFAULT_KANSHI_DIR="$HOME/.config/regolith3/kanshi"
 KANSHI_DIR=${REGOLITH_KANSHI_DIR:-"$DEFAULT_KANSHI_DIR"}
 PROFILES_DIR="$KANSHI_DIR/profiles"
 
-# Print the kanshi "include" directive that loads every file in directory $1.
+# Every kanshi expands the include path with wordexp(3), like a shell word, but
+# reads the line around it in one of two ways:
 #
-# kanshi expands the include path with wordexp(3), like a shell word, so the
-# directory is quoted for the shell and only the trailing "*" is left to glob.
-# glibc's wordexp() then passes the whole word, quoted part included, to
+#  - kanshi 1.6 and later ("scfg"): the argument must be exactly one scfg word,
+#    a bare atom with backslash escapes or a single- or double-quoted string.
+#  - kanshi before 1.6 ("legacy"): the raw rest of the line, without escape
+#    sequences. Only the quotes around a leading quoted word are removed:
+#    double quotes from 1.2, single quotes too from 1.3.
+#
+# Print the syntax of the installed kanshi; "scfg" if its version is unknown.
+kanshi_syntax() {
+	local version
+	version=$(dpkg-query -W -f '${Version}' kanshi 2> /dev/null) || version=
+	if [ -n "$version" ] && dpkg --compare-versions "$version" lt 1.6~; then
+		echo legacy
+	else
+		echo scfg
+	fi
+}
+
+# kanshi_include <directory> <scfg|legacy>: print the kanshi "include"
+# directive that loads every file in <directory>, in that kanshi syntax.
+#
+# The directory is quoted for the shell and only the trailing "*" is left to
+# glob. glibc's wordexp() passes the whole word, quoted part included, to
 # glob(): the characters that glob() reads as a pattern are escaped first.
-# kanshi 1.6 and later read the line with scfg syntax, where a quoted argument
-# may hold spaces and, between double quotes, backslash escapes; older kanshi
-# passes the raw rest of the line on, after stripping the quotes around a first
-# quoted word. Single quotes around the whole argument mean the same to both,
-# so they are used unless the path itself holds a single quote.
 kanshi_include() {
-	local dir=$1 bs=\\ pattern quoted
+	local dir=$1 syntax=$2 bs=\\ pattern quoted char i
 	case $dir in
 	*$'\n'*)
 		echo "regolith-displayd-init: kanshi cannot include a path that contains a newline: $dir" >&2
@@ -32,6 +47,23 @@ kanshi_include() {
 		return
 		;;
 	esac
+
+	if [ "$syntax" = legacy ]; then
+		# A shell backslash before every special character and no quotes,
+		# so the line starts with neither a quote nor "#" and kanshi passes
+		# it on unchanged. Legacy kanshi reads at most 1022 bytes of it.
+		quoted=
+		for ((i = 0; i < ${#dir}; i++)); do
+			char=${dir:i:1}
+			case $char in
+			["$bs"'*?[']) quoted+="$bs$bs$bs$char" ;;
+			[A-Za-z0-9_./+,:@%=-]) quoted+=$char ;;
+			*) quoted+="$bs$char" ;;
+			esac
+		done
+		printf 'include %s/*\n' "$quoted"
+		return
+	fi
 
 	pattern=${dir//"$bs"/"$bs$bs"}
 	pattern=${pattern//'*'/"$bs*"}
@@ -48,7 +80,6 @@ kanshi_include() {
 		printf "include '\"%s\"/*'\n" "$quoted"
 	else
 		# Shell single quotes inside scfg double quotes, escaped for scfg.
-		# kanshi before 1.6 cannot read this form.
 		quoted="'${pattern//"'"/"'$bs''"}'/*"
 		quoted=${quoted//"$bs"/"$bs$bs"}
 		quoted=${quoted//'"'/"$bs\""}
@@ -58,15 +89,23 @@ kanshi_include() {
 
 mkdir -p "$PROFILES_DIR"
 
-# create config file if doesn't already exist, or replace the unquoted one
-# that earlier versions wrote for a directory that needs quoting: kanshi
-# cannot read it
+# Create the config file if it doesn't exist yet. Replace a config that this
+# script wrote for the other kanshi syntax (the kanshi package was upgraded or
+# downgraded since) or the unquoted one that earlier versions wrote for a
+# directory that needs quoting: the installed kanshi cannot read them. Leave
+# any other config alone.
 CONFIG="$KANSHI_DIR/config"
-INCLUDE=$(kanshi_include "$PROFILES_DIR")
-UNQUOTED_INCLUDE="include $PROFILES_DIR/*"
-if [ ! -f "$CONFIG" ] ||
-	{ [ "$INCLUDE" != "$UNQUOTED_INCLUDE" ] && [ "$(cat "$CONFIG")" = "$UNQUOTED_INCLUDE" ]; }; then
+INCLUDE=$(kanshi_include "$PROFILES_DIR" "$(kanshi_syntax)")
+if [ ! -f "$CONFIG" ]; then
 	printf '%s\n' "$INCLUDE" > "$CONFIG"
+else
+	CURRENT=$(cat "$CONFIG")
+	if [ "$CURRENT" != "$INCLUDE" ] &&
+		{ [ "$CURRENT" = "include $PROFILES_DIR/*" ] ||
+			[ "$CURRENT" = "$(kanshi_include "$PROFILES_DIR" scfg)" ] ||
+			[ "$CURRENT" = "$(kanshi_include "$PROFILES_DIR" legacy)" ]; }; then
+		printf '%s\n' "$INCLUDE" > "$CONFIG"
+	fi
 fi
 
 shopt -s nullglob

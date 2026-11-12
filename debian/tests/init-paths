@@ -1,11 +1,13 @@
 #!/bin/bash
 # regolith-displayd-init must create a kanshi configuration that the installed
 # kanshi reads, whatever the home directory is called: plain, with spaces,
-# with double or single quotes, backslashes or shell syntax in it. For each
-# home, check that the initializer succeeds and is idempotent, that kanshi
-# parses the configuration it wrote, and, on a headless sway, that kanshi
-# applies a profile from the profiles directory that it includes. An unquoted
-# configuration written by earlier versions for such a home must be replaced.
+# with double or single quotes, backslashes or shell syntax in it, and whatever
+# kanshi version is installed. For each home, check that the initializer
+# succeeds and is idempotent, that kanshi parses the configuration it wrote and
+# reads the profiles directory that it includes, and, on a headless sway, that
+# kanshi applies a profile from there. An unquoted configuration written by
+# earlier versions for such a home, or one written for another kanshi version,
+# must be replaced.
 set -euo pipefail
 
 work=$(mktemp -d)
@@ -50,14 +52,9 @@ out = next(o for o in json.load(sys.stdin) if o["name"] == "HEADLESS-1")
 sys.exit(out["scale"] != float(sys.argv[1]))' "$1"
 }
 
-# kanshi before 1.6 reads the include line raw and cannot take a path with a
-# single quote in the form that kanshi 1.6 and later need.
-old_kanshi=no
-if dpkg --compare-versions "$(dpkg-query -W -f '${Version}' kanshi)" lt 1.6; then
-    old_kanshi=yes
-fi
+echo "kanshi $(dpkg-query -W -f '${Version}' kanshi)"
 
-# The last home holds shell syntax that must stay literal.
+# The last homes hold shell syntax that must stay literal.
 # shellcheck disable=SC2016
 homes=(
     "home"
@@ -66,6 +63,7 @@ homes=(
     "home's"
     "it's \"all\" \\ [of] them"
     'back\slash $HOME `true` {x} [x] * ? ; | & ( )'
+    $'tab\there #hash ~tilde <angle> !bang'
 )
 
 # check_home <home>: run the initializer for <home> and check the result.
@@ -86,18 +84,22 @@ check_home() {
     [ "$out" = "FOUND 1 profiles" ] || fail "[$1] the second run printed: $out"
     cmp -s "$config" "$work/config.first" || fail "[$1] the second run changed the configuration"
 
-    if [ "$old_kanshi" = yes ] && [[ $1 == *"'"* ]]; then
-        echo "[$1] note: kanshi $(dpkg-query -W -f '${Version}' kanshi) cannot include a path with a single quote, kanshi checks skipped"
-        return
-    fi
-
     # kanshi reads its configuration before it connects to the compositor.
     WAYLAND_DISPLAY=no-such-display kanshi -c "$config" > "$work/parse.log" 2>&1 || true
-    if grep -qE 'parse|Could not|expected|scfg|unknown directive|unterminated' "$work/parse.log"; then
+    if grep -qE 'parse|Could not|expected|scfg|unknown directive|unterminated|too long' "$work/parse.log"; then
         fail "[$1] kanshi cannot read the configuration: $(tr '\n' ' ' < "$work/parse.log")"
     fi
     grep -q 'failed to connect to display' "$work/parse.log" \
         || fail "[$1] kanshi did not get past its configuration: $(tr '\n' ' ' < "$work/parse.log")"
+
+    # The include must reach the profiles directory: a broken file there
+    # breaks the configuration. This also holds where the headless scale
+    # checks below cannot run.
+    echo "init-paths-probe" > "$profiles/probe"
+    WAYLAND_DISPLAY=no-such-display kanshi -c "$config" > "$work/probe-parse.log" 2>&1 || true
+    rm "$profiles/probe"
+    grep -q "init-paths-probe" "$work/probe-parse.log" \
+        || fail "[$1] kanshi did not read the profiles directory: $(tr '\n' ' ' < "$work/probe-parse.log")"
 
     if [ "$scale_checks" = yes ]; then
         printf 'profile headless {\n\toutput HEADLESS-1 scale 2\n}\n' > "$profiles/headless"
@@ -145,5 +147,23 @@ legacy="$work/homes/legacy home"
 mkdir -p "$legacy/.config/regolith3/kanshi"
 echo "include $legacy/.config/regolith3/kanshi/profiles/*" > "$legacy/.config/regolith3/kanshi/config"
 check_home "legacy home"
+
+# kanshi before 1.6 and kanshi 1.6 or later need different quoting. A
+# configuration written for the other one (kanshi was upgraded or downgraded
+# since) is replaced. Both forms are written here, for a home with a space.
+if [[ $work == *[!A-Za-z0-9_./-]* ]]; then
+    echo "note: $work itself needs quoting, configurations for another kanshi not checked"
+else
+    for form in before-1.6 1.6; do
+        kanshi_dir="$work/homes/$form switched/.config/regolith3/kanshi"
+        mkdir -p "$kanshi_dir"
+        if [ "$form" = before-1.6 ]; then
+            echo "include ${kanshi_dir// /\\ }/profiles/*"
+        else
+            echo "include '\"$kanshi_dir/profiles\"/*'"
+        fi > "$kanshi_dir/config"
+        check_home "$form switched"
+    done
+fi
 
 echo "PASS"

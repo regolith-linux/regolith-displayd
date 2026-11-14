@@ -1,6 +1,6 @@
 [package]
 name = "regolith-displayd"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 # The oldest toolchain the package is built with (Ubuntu 22.04). Clippy
 # only suggests what this version supports.

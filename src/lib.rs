@@ -798,7 +798,8 @@ fn verify_layout(config: &[MonitorApply], monitors: &[Monitor]) -> zbus::fdo::Re
         .map(|logical| {
             let (x, y) = logical.position();
             let (w, h) = logical.logical_size(monitors);
-            (x, y, x + w, y + h)
+            // Positions come straight from the D-Bus caller: don't overflow.
+            (x, y, x.saturating_add(w), y.saturating_add(h))
         })
         .collect();
     if rects.iter().any(|r| r.0 < 0 || r.1 < 0) {
@@ -1896,6 +1897,18 @@ mod layout_tests {
             .map(|(i, logical)| primary(logical, i == 0))
             .collect();
         verify_layout(&config, &monitors()).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn extreme_positions_are_refused() {
+        for (x, y) in [(i32::MAX, 0), (0, i32::MAX), (i32::MAX, i32::MAX)] {
+            assert!(check(&[logical(x, y, 1.0, 0, &["DP-1"])]).is_err());
+        }
+        assert!(check(&[
+            logical(0, 0, 1.0, 0, &["DP-1"]),
+            logical(i32::MAX, 0, 1.0, 0, &["DP-2"]),
+        ])
+        .is_err());
     }
 
     #[test]

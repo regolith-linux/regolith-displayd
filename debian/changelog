@@ -1,3 +1,18 @@
+regolith-displayd (0.6.0) jammy; urgency=medium
+
+  [ rego-port-bot ]
+  * feat: apply Night Light in the Wayland session
+  * refactor: use wayland-client for the Night Light gamma tables
+  * test: don't run the fake kanshi scripts while another child holds them open
+  * fix: quote paths in regolith-displayd-init and the kanshi include
+  * test: check the kanshi configuration for home directories with spaces and quotes
+  * fix: write the kanshi include in the syntax of the installed kanshi
+  * test: check the kanshi include on every kanshi version and its directory
+  * fix: refuse layouts with extreme positions instead of overflowing
+  * fix: find the home directory without $HOME instead of panicking
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 14 Nov 2026 09:40:52 -0800
+
 regolith-displayd (0.5.0) jammy; urgency=medium
 
   [ rego-port-bot ]

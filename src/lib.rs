@@ -678,10 +678,23 @@ impl Error for ServerError {
     }
 }
 
+/// The user's home directory: `$HOME`, or else the one in the user's passwd
+/// entry, for the environments that don't set `$HOME`. That is what std's
+/// home_dir does on Unix (getpwuid_r); it is deprecated only because of its
+/// Windows behaviour.
+fn home_dir() -> Option<PathBuf> {
+    #[allow(deprecated)]
+    std::env::home_dir().filter(|home| !home.as_os_str().is_empty())
+}
+
 pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
-    let env_vars: HashMap<String, String> = std::env::vars().collect();
-    let home_dir = env_vars.get("HOME").expect("$HOME not defined");
-    let default_path = format!("{home_dir}/.config/regolith3/kanshi");
+    let home_dir = home_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory: $HOME is not set and the user has no passwd entry",
+        )
+    })?;
+    let default_path = format!("{}/.config/regolith3/kanshi", home_dir.display());
     let base: PathBuf = match trawlcat::rescat("kanshi.path", Some(default_path.clone())).await {
         Ok(path) => path.into(),
         Err(e) => {

@@ -1,8 +1,8 @@
 use log::error;
 use regolith_displayd::{confirm, night_light, DisplayManager, DisplayServer};
-use std::{error::Error, future::pending, sync::Arc};
+use std::{error::Error, sync::Arc};
 use swayipc_async::Connection as SwayConection;
-use tokio::{sync::Mutex, try_join};
+use tokio::sync::Mutex;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // The daemon runs itself with these arguments to show the prompt that
@@ -32,15 +32,11 @@ async fn daemon() -> Result<(), Box<dyn Error>> {
     // Apply the color plugin's Night Light temperature, as Mutter does.
     night_light::spawn();
 
-    let watch_handle = tokio::spawn(async move {
-        DisplayManager::watch_changes(manager_ref, sway_connection_ref)
-            .await
-            .unwrap();
-    });
-
-    if let Err(e) = try_join!(watch_handle) {
-        error!("{}", e);
+    // Following sway's outputs only stops on an error, typically because
+    // sway has gone away. Exit then, instead of serving outdated monitors:
+    // the service restarts the daemon, which connects to sway again.
+    if let Err(e) = DisplayManager::watch_changes(manager_ref, sway_connection_ref).await {
+        error!("Stopped following sway's outputs: {e}");
     }
-    pending::<()>().await;
-    Ok(())
+    std::process::exit(1);
 }

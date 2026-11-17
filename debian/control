@@ -14,7 +14,7 @@ Package: regolith-displayd
 Architecture: any
 Multi-Arch: foreign
 Depends: ${misc:Depends}, ${shlibs:Depends}, fonts-dejavu-core, kanshi, procps
-Recommends: gnome-control-center
+Suggests: gnome-control-center
 Description: Daemon for enabling inter-op between 
   gnome-control-center display panel and sway 
   by providing relevant dbus bindings

@@ -57,10 +57,20 @@ dc() {
         --method "org.gnome.Mutter.DisplayConfig.$1" "${@:2}"
 }
 
-# apply <method> <scale> <mode>
+current_serial() {
+    dc GetCurrentState | sed -E 's/^\(uint32 ([0-9]+),.*/\1/'
+}
+
+# apply_with <serial> <method> <scale> <mode>
+apply_with() {
+    dc ApplyMonitorsConfig "$1" "$2" \
+        "[(0, 0, $3, 0, true, [('HEADLESS-1', '$4', @a{sv} {})])]" "@a{sv} {}"
+}
+
+# apply <method> <scale> <mode>, with the serial read just before, as
+# clients do: every change moves the serial on.
 apply() {
-    dc ApplyMonitorsConfig "$serial" "$1" \
-        "[(0, 0, $2, 0, true, [('HEADLESS-1', '$3', @a{sv} {})])]" "@a{sv} {}"
+    apply_with "$(current_serial)" "$@"
 }
 
 # Keep a persistent change: Enter at its confirmation prompt, which has the
@@ -228,11 +238,29 @@ fi
 [ "$(swaymsg -t get_outputs | python3 -c 'import json, sys; print(sum(o["active"] for o in json.load(sys.stdin)))')" -ge 1 ] \
     || fail "a refused configuration switched the outputs off"
 echo "ok: empty and mirrored configurations are refused and change nothing"
+[ "$(current_serial)" = "$serial" ] || fail "verify or a refused Apply moved the serial from $serial to $(current_serial)"
+echo "ok: verify and refused Applies keep the serial"
 
 apply 1 2.0 "$mode" > /dev/null || fail "a temporary Apply failed"
 retry 40 sway_scale_is 2.0 || fail "the temporary Apply did not take effect in sway"
 [ "$(profile_files)" = "$before" ] || fail "a temporary Apply wrote a kanshi profile"
 echo "ok: a temporary Apply takes effect and writes nothing"
+
+# The change moved the serial on, as in Mutter: a configuration composed for
+# the state before it is refused by every method, and changes nothing.
+old_serial=$serial
+serial=$(current_serial)
+[ "$serial" != "$old_serial" ] || fail "the serial is still $old_serial after the temporary Apply"
+for method in 0 1 2; do
+    if apply_with "$old_serial" "$method" 1.0 "$mode" > /dev/null 2>&1; then
+        fail "method $method with the serial from before the temporary Apply succeeded"
+    fi
+done
+sleep 1
+sway_scale_is 2.0 || fail "an Apply with an old serial changed the scale"
+[ "$(profile_files)" = "$before" ] || fail "an Apply with an old serial wrote a kanshi profile"
+[ "$(current_serial)" = "$serial" ] || fail "the serial moved from $serial while nothing changed"
+echo "ok: the serial moved from $old_serial to $serial; the old one is refused by every method and changes nothing"
 
 for scale in 2 1 2; do
     previous=$(our_kanshi)

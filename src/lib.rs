@@ -1416,6 +1416,44 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn profiles_are_replaced_whole() {
+        let dir = std::env::temp_dir().join(format!("displayd-write-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let profiles = dir.join("profiles");
+
+        // A new profile, in a profiles directory that doesn't exist yet.
+        write_profile(&profiles, "Acme_View_24_0", b"profile {}\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(profiles.join("Acme_View_24_0")).unwrap(),
+            "profile {}\n"
+        );
+        // A profile saved again for the same monitors replaces the old one.
+        write_profile(
+            &profiles,
+            "Acme_View_24_0",
+            OLD_IDENTICAL_PROFILE.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(profiles.join("Acme_View_24_0")).unwrap(),
+            OLD_IDENTICAL_PROFILE
+        );
+        assert_eq!(file_names(&profiles), ["Acme_View_24_0"]);
+
+        // A profile that can't be replaced (here, a directory with that
+        // name) stays as it was, and nothing is left behind.
+        fs::create_dir_all(profiles.join("blocked")).unwrap();
+        fs::write(profiles.join("blocked/kept"), "kept").unwrap();
+        assert!(write_profile(&profiles, "blocked", b"profile {}\n").is_err());
+        assert_eq!(
+            fs::read_to_string(profiles.join("blocked/kept")).unwrap(),
+            "kept"
+        );
+        assert_eq!(file_names(&profiles), ["Acme_View_24_0", "blocked"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn file_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .into_iter()
@@ -2373,6 +2411,28 @@ async fn prompt_output(sway: &Mutex<Connection>) -> String {
         .unwrap_or_default()
 }
 
+/// Write `contents` as profile `name` in the profiles directory `dir`, so
+/// that kanshi, and the checks on the profiles, find either the whole old
+/// profile or the whole new one, never part of one: a full disk or a crash
+/// in the middle of writing leaves the old profile as it was.
+///
+/// The contents go to a hidden file in `dir` first, which then replaces the
+/// profile. kanshi includes `profiles/*`, which leaves out hidden files.
+fn write_profile(dir: &Path, name: &str, contents: &[u8]) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let temporary = dir.join(format!(".{name}.{}", std::process::id()));
+    let written = fs::File::create(&temporary)
+        .and_then(|mut file| {
+            file.write_all(contents)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temporary, dir.join(name)));
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written
+}
+
 /// Save a kept configuration as kanshi profile `profile_name`, and have
 /// kanshi load it.
 async fn save_profile(
@@ -2381,8 +2441,7 @@ async fn save_profile(
     profile_buf: &[u8],
 ) -> zbus::fdo::Result<()> {
     let kanshi_paths = get_kanshi_paths().await?;
-    fs::create_dir_all(&kanshi_paths.profiles)
-        .and_then(|_| fs::write(kanshi_paths.profiles.join(profile_name), profile_buf))
+    write_profile(&kanshi_paths.profiles, profile_name, profile_buf)
         .map_err(|e| zbus::fdo::Error::IOError(e.to_string()))?;
     // An older profile for the same identical monitors names one output
     // twice and would still keep kanshi from loading any profile.

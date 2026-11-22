@@ -342,8 +342,14 @@ impl DisplayServer {
         let kanshi_paths = get_kanshi_paths().await?;
         set_aside_invalid_profiles(&kanshi_paths);
         let outputs = self.sway_connection.lock().await.get_outputs().await?;
-        let (monitors, _) = DisplayManager::monitors_of(&outputs);
+        let (monitors, logical_monitors) = DisplayManager::monitors_of(&outputs);
         hold_profiles_for_other_monitors(&kanshi_paths, &connected_outputs(&monitors));
+        // The first GetCurrentState, which may come as soon as the name is
+        // taken, reports these outputs, at the first serial.
+        self.manager
+            .lock()
+            .await
+            .start_with(monitors, logical_monitors);
 
         let mut connection = ZBUS_CONNECTION.lock().await;
         *connection = Some(
@@ -598,6 +604,14 @@ impl DisplayManager {
             monitor.keep_known_modes(&self.monitors);
         }
         (monitors, logical_monitors)
+    }
+
+    /// Store the outputs sway has when the daemon starts, before anyone has
+    /// been told about any state: they are the first state, not a change,
+    /// so the serial stays and nothing is emitted.
+    fn start_with(&mut self, monitors: Vec<Monitor>, logical_monitors: Vec<LogicalMonitor>) {
+        self.monitors = monitors;
+        self.logical_monitors = logical_monitors;
     }
 
     /// The monitors of sway's `outputs`, and the logical monitors of the
@@ -1833,6 +1847,29 @@ mod hotplug_tests {
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(connectors(&manager), ["DP-1"]);
         assert_eq!(manager.serial, 2);
+    }
+
+    #[test]
+    fn the_outputs_at_startup_are_the_first_state() {
+        let mut manager = DisplayManager {
+            serial: 0,
+            monitors: Vec::new(),
+            logical_monitors: Vec::new(),
+            properties: DisplayManagerProperties::new(),
+        };
+        let (monitors, logical_monitors) = state(&[dp1(), dp2()]);
+        manager.start_with(monitors, logical_monitors);
+        assert_eq!(connectors(&manager), ["DP-1", "DP-2"]);
+        assert_eq!(manager.logical_monitors.len(), 2);
+        assert_eq!(manager.serial, 0);
+        // The watcher's first look finds nothing new to report.
+        let (monitors, logical_monitors) = state(&[dp1(), dp2()]);
+        assert!(!manager.update(monitors, logical_monitors));
+        assert_eq!(manager.serial, 0);
+        // Later changes are reported as before.
+        let (monitors, logical_monitors) = state(&[dp1()]);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(manager.serial, 1);
     }
 
     #[test]

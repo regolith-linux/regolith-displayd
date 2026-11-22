@@ -8,6 +8,7 @@ pub mod monitor;
 pub mod night_light;
 
 use core::fmt;
+use kanshi::NamedOutput;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
@@ -393,7 +394,7 @@ impl DisplayManager {
     /// another connected monitor has the same description or kanshi cannot
     /// read the description back as it is (see [`Monitor::named_by_connector`]).
     /// The file name joins those names, sorted, so the same set of monitors
-    /// always maps to the same file.
+    /// always maps to the same file (see [`kanshi::profile_file_name`]).
     ///
     /// A connector name says nothing about the monitor plugged into it, so a
     /// profile that uses one also records which monitor it was saved for, in
@@ -463,39 +464,114 @@ impl DisplayManager {
         (profile_name, profile_buf)
     }
 
-    /// The file name of the kanshi profile for the connected monitors, and
-    /// the outputs it names by connector, with the monitor saved for each.
+    /// The file name of the kanshi profile for the connected monitors (see
+    /// [`kanshi::profile_file_name`]), and the outputs it names by connector,
+    /// with the monitor saved for each.
     fn kanshi_profile_name(&self) -> (String, Vec<(String, String)>) {
-        let mut names = Vec::new();
-        let mut pinned = Vec::new();
-        for monitor in &self.monitors {
-            let name = monitor.kanshi_name(&self.monitors);
-            let description = monitor.get_dpy_name();
-            if name == description {
-                names.push(description);
-            } else {
-                names.push(format!("{name}={description}"));
-                pinned.push((name, description));
-            }
-        }
-        names.sort();
-        pinned.sort();
-        let mut profile_name = names
+        let outputs: Vec<NamedOutput> = self
+            .monitors
             .iter()
-            .map(|name| name.replace(' ', "_"))
-            .collect::<Vec<String>>()
-            .join("__");
-        if !pinned.is_empty() {
-            profile_name.insert_str(0, "zz-");
-        }
-        (profile_name, pinned)
+            .map(|monitor| {
+                let connector = monitor
+                    .named_by_connector(&self.monitors)
+                    .then(|| monitor.connector().to_string());
+                (connector, monitor.get_dpy_name())
+            })
+            .collect();
+        let mut pinned: Vec<(String, String)> = outputs
+            .iter()
+            .filter_map(|(connector, description)| Some((connector.clone()?, description.clone())))
+            .collect();
+        pinned.sort();
+        (kanshi::profile_file_name(&outputs), pinned)
+    }
+
+    /// How earlier versions named the connected monitors in a profile: by
+    /// connector only if another monitor had the same description, else by
+    /// description, written as it is.
+    fn earlier_outputs(&self) -> Vec<NamedOutput> {
+        self.monitors
+            .iter()
+            .map(|monitor| {
+                let description = monitor.get_dpy_name();
+                let same = self
+                    .monitors
+                    .iter()
+                    .filter(|other| other.get_dpy_name() == description)
+                    .count();
+                let connector = (same > 1).then(|| monitor.connector().to_string());
+                (connector, description)
+            })
+            .collect()
+    }
+
+    /// The file name earlier versions gave the profile of the connected
+    /// monitors, if it differs from the name it has now and is a file name.
+    fn earlier_profile_name(&self) -> Option<String> {
+        let name = kanshi::earlier_profile_file_name(&self.earlier_outputs());
+        let is_file_name = !name.is_empty()
+            && name.len() <= kanshi::NAME_MAX
+            && !name.contains(['/', '\0'])
+            && name != "."
+            && name != "..";
+        (is_file_name && name != self.kanshi_profile_name().0).then_some(name)
+    }
+
+    /// Whether `profile` is a profile that earlier versions saved for exactly
+    /// the connected monitors, in any arrangement: the comment that records
+    /// the primary monitor, if any, the comment for each monitor named by its
+    /// connector, sorted, then "profile {", a line for each monitor, in any
+    /// order, and "}". They wrote each name as it is, a quote or a newline
+    /// included, so the lines are told apart by comparing them with the names
+    /// of the connected monitors.
+    fn is_earlier_profile(&self, profile: &str) -> bool {
+        let outputs = self.earlier_outputs();
+        let names: Vec<&str> = outputs
+            .iter()
+            .map(|(connector, description)| connector.as_deref().unwrap_or(description))
+            .collect();
+        let mut pinned: Vec<(&str, &str)> = outputs
+            .iter()
+            .filter_map(|(connector, description)| {
+                Some((connector.as_deref()?, description.as_str()))
+            })
+            .collect();
+        pinned.sort();
+        let notes: String = pinned
+            .iter()
+            .map(|(connector, description)| {
+                format!("{PINNED_OUTPUT} \"{connector}\" is \"{description}\"\n")
+            })
+            .collect();
+        let primaries = names
+            .iter()
+            .map(|name| format!("{PRIMARY_OUTPUT} \"{name}\"\n"));
+        std::iter::once(String::new())
+            .chain(primaries)
+            .any(|primary| {
+                profile
+                    .strip_prefix(primary.as_str())
+                    .and_then(|rest| rest.strip_prefix(notes.as_str()))
+                    .and_then(|rest| rest.strip_prefix("profile {\n"))
+                    .is_some_and(|lines| {
+                        names_each_once(lines, &names, &mut vec![false; names.len()])
+                    })
+            })
     }
 
     /// The primary monitor saved with the profile of the connected monitors,
-    /// by connector.
+    /// by connector. Until that profile is saved again, it may be the profile
+    /// that earlier versions saved for them under another file name.
     fn saved_primary(&self, paths: &KanshiPaths) -> Option<String> {
         let (profile_name, _) = self.kanshi_profile_name();
-        let profile = fs::read_to_string(paths.profiles.join(profile_name)).ok()?;
+        let profile = fs::read_to_string(paths.profiles.join(profile_name))
+            .ok()
+            .or_else(|| {
+                let earlier = paths.profiles.join(self.earlier_profile_name()?);
+                fs::read_to_string(earlier)
+                    .ok()
+                    .filter(|profile| self.is_earlier_profile(profile))
+            })?;
         let name = profile.lines().find_map(|line| {
             let rest = line.trim().strip_prefix(PRIMARY_OUTPUT)?.trim();
             match kanshi::unquote(rest) {
@@ -507,9 +583,11 @@ impl DisplayManager {
                     .map(str::to_string),
             }
         })?;
+        // By connector or by description, as this version or an earlier one
+        // named it: a description holds spaces, a connector name none.
         self.monitors
             .iter()
-            .find(|monitor| monitor.kanshi_name(&self.monitors) == name)
+            .find(|monitor| monitor.connector() == name || monitor.get_dpy_name() == name)
             .map(|monitor| monitor.connector().to_string())
     }
 
@@ -892,6 +970,61 @@ fn pinned_outputs(profile: &str) -> Vec<(String, String)> {
             Some((connector.to_string(), description.to_string()))
         })
         .collect()
+}
+
+/// Whether `lines`, the lines of a profile after "profile {" as earlier
+/// versions wrote them, name each of `names` once, in any order, and then
+/// end with "}". `read` tells which names have been read so far.
+fn names_each_once(lines: &str, names: &[&str], read: &mut [bool]) -> bool {
+    if read.iter().all(|read| *read) {
+        return lines == "}\n";
+    }
+    (0..names.len()).any(|i| {
+        if read[i] {
+            return false;
+        }
+        // The settings after the name hold no newline.
+        let Some((_, rest)) = lines
+            .strip_prefix("\toutput \"")
+            .and_then(|rest| rest.strip_prefix(names[i]))
+            .and_then(|rest| rest.strip_prefix("\" "))
+            .and_then(|rest| rest.split_once('\n'))
+        else {
+            return false;
+        };
+        read[i] = true;
+        let named = names_each_once(rest, names, read);
+        read[i] = false;
+        named
+    })
+}
+
+/// Remove the profile that earlier versions saved for the connected
+/// monitors under another file name than `profile_name`, which now holds
+/// their profile: kanshi would go on loading both, and may apply the old one.
+/// Only if it is such a profile (see [`DisplayManager::is_earlier_profile`]):
+/// a file for other monitors may have the same name, and stays.
+fn remove_superseded_profile(paths: &KanshiPaths, manager: &DisplayManager, profile_name: &str) {
+    if manager.kanshi_profile_name().0 != profile_name {
+        // Saved for monitors that are no longer the connected ones.
+        return;
+    }
+    let Some(earlier) = manager.earlier_profile_name() else {
+        return;
+    };
+    let path = paths.profiles.join(earlier);
+    let Ok(profile) = fs::read_to_string(&path) else {
+        return;
+    };
+    if !manager.is_earlier_profile(&profile) {
+        return;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => info!(
+            "Removed kanshi profile {path:?}: the profile of these monitors is {profile_name:?} now"
+        ),
+        Err(e) => error!("Cannot remove kanshi profile {path:?}: {e}"),
+    }
 }
 
 /// The description of the monitor on each connector.
@@ -1407,19 +1540,146 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("displayd-kanshi-unusual-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let (_, contents) = profile(
-            unusual_monitors(),
-            &[place("DP-1", 0), place("DP-2", 1920), place("DP-3", 3840)],
-        );
+        let profiles = dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
         let config = dir.join("config");
-        fs::write(&config, contents).unwrap();
+        fs::write(&config, format!("include {}/*\n", profiles.display())).unwrap();
+        let mut long = unusual_monitors();
+        long.push(monitor("DP-4", "Acme", &"L".repeat(300), "S1"));
+        for monitors in [unusual_monitors(), long] {
+            let (name, contents) = profile(
+                monitors,
+                &[place("DP-1", 0), place("DP-2", 1920), place("DP-3", 3840)],
+            );
+            let path = profiles.join(&name);
+            assert_eq!(path.parent(), Some(profiles.as_path()), "{name}");
+            fs::write(path, contents).unwrap();
+        }
+        assert_eq!(file_names(&profiles).len(), 2);
         let stderr = kanshi_parse(kanshi, &dir, &config);
         assert!(
             stderr.contains("failed to connect to display"),
-            "kanshi rejected the profile: {stderr}"
+            "kanshi rejected the profiles: {stderr}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_saved_under_earlier_names_are_removed() {
+        let dir =
+            std::env::temp_dir().join(format!("displayd-superseded-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = KanshiPaths {
+            profiles: dir.join("profiles"),
+            config: dir.join("config"),
+        };
+        fs::create_dir_all(&paths.profiles).unwrap();
+        let manager = manager_for(vec![
+            monitor("DP-1", "Acme", "LG_Ultra", "S1"),
+            monitor("DP-2", "Plain", "M2", "S2"),
+        ]);
+        let (name, _) = manager.kanshi_profile_name();
+        assert_eq!(name, "Acme_LG%5FUltra_S1__Plain_M2_S2");
+        let earlier = manager.earlier_profile_name().unwrap();
+        assert_eq!(earlier, "Acme_LG_Ultra_S1__Plain_M2_S2");
+        let saved = |file: &str, contents: &str| {
+            fs::write(paths.profiles.join(file), contents).unwrap();
+        };
+        let old = "# regolith-displayd: primary \"Plain M2 S2\"\n\
+                   profile {\n\
+                   \toutput \"Plain M2 S2\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+                   \toutput \"Acme LG_Ultra S1\" disable\n\
+                   }\n";
+        let (_, contents) = manager.saved_profile(&[arrange("DP-1", 0, true)]);
+        let contents = String::from_utf8(contents).unwrap();
+
+        // Under the earlier name, files for other monitors stay: one of these
+        // monitors, one more, another profile too, or a connector comment
+        // that these monitors do not need.
+        for other in [
+            "profile {\n\toutput \"Acme LG Ultra S1\" enable\n\toutput \"Plain M2 S2\" enable\n}\n"
+                .to_string(),
+            "profile {\n\toutput \"Acme LG_Ultra S1\" enable\n}\n".to_string(),
+            old.replace("}\n", "\toutput \"Plain M3 S3\" disable\n}\n"),
+            format!("{old}profile {{\n\toutput \"Plain M2 S2\" enable\n}}\n"),
+            format!("# regolith-displayd: output \"DP-1\" is \"Acme LG_Ultra S1\"\n{old}"),
+        ] {
+            saved(&earlier, &other);
+            saved(&name, &contents);
+            remove_superseded_profile(&paths, &manager, &name);
+            assert_eq!(
+                fs::read_to_string(paths.profiles.join(&earlier)).unwrap(),
+                other
+            );
+        }
+        // Until the monitors are saved again, the earlier profile has their
+        // primary monitor; then it goes.
+        fs::remove_file(paths.profiles.join(&name)).unwrap();
+        saved(&earlier, old);
+        assert_eq!(manager.saved_primary(&paths).as_deref(), Some("DP-2"));
+        saved(&name, &contents);
+        assert_eq!(manager.saved_primary(&paths).as_deref(), Some("DP-1"));
+        remove_superseded_profile(&paths, &manager, &name);
+        assert_eq!(file_names(&paths.profiles), [name.as_str()]);
+        // Not when the profile was saved for other monitors.
+        saved(&earlier, old);
+        remove_superseded_profile(&paths, &manager, "another-set");
+        assert_eq!(file_names(&paths.profiles).len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn earlier_profiles_with_unusual_names_are_recognised() {
+        // A newline: kanshi before 1.6 read such a profile, and an earlier
+        // name differs from the name now.
+        let manager = manager_for(vec![monitor("DP-1", "Acme", "M\n1", "S1")]);
+        let earlier = "profile {\n\
+                       \toutput \"Acme M\n1 S1\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+                       }\n";
+        assert!(manager.is_earlier_profile(earlier));
+        assert_eq!(
+            manager.earlier_profile_name().as_deref(),
+            Some("Acme_M\n1_S1")
+        );
+        assert_eq!(manager.kanshi_profile_name().0, "zz-DP-1=Acme_M%0A1_S1");
+
+        // Identical monitors: only with the monitor recorded on each connector.
+        let identical = manager_for(vec![
+            monitor("DP-1", "Same", "M_1", "S1"),
+            monitor("DP-2", "Same", "M_1", "S1"),
+        ]);
+        let profile = "profile {\n\toutput \"DP-2\" disable\n\toutput \"DP-1\" enable\n}\n";
+        let one = "# regolith-displayd: output \"DP-1\" is \"Same M_1 S1\"\n";
+        let two = "# regolith-displayd: output \"DP-2\" is \"Same M_1 S1\"\n";
+        let elsewhere = "# regolith-displayd: output \"DP-2\" is \"Other M_1 S1\"\n";
+        assert!(identical.is_earlier_profile(&format!("{one}{two}{profile}")));
+        assert!(identical.is_earlier_profile(&format!(
+            "# regolith-displayd: primary \"DP-1\"\n{one}{two}{profile}"
+        )));
+        for other in [
+            profile.to_string(),
+            format!("{one}{profile}"),
+            format!("{two}{one}{profile}"),
+            format!("{one}{elsewhere}{profile}"),
+            format!("{one}{two}{elsewhere}{profile}"),
+            format!("{one}{two}{profile}{profile}"),
+        ] {
+            assert!(!identical.is_earlier_profile(&other), "{other}");
+        }
+
+        // A name that holds the start of another line: the lines can be read
+        // in more than one way, and one of them names each monitor once.
+        let tricky = manager_for(vec![
+            monitor("DP-1", "X", "Y", "Z"),
+            monitor("DP-2", "X", "Y", "Z\" disable\n\toutput \"X Y Z"),
+        ]);
+        let lines = "profile {\n\
+                     \toutput \"X Y Z\" disable\n\
+                     \toutput \"X Y Z\" disable\n\
+                     \toutput \"X Y Z\" disable\n\
+                     }\n";
+        assert!(tricky.is_earlier_profile(lines));
+        assert!(!tricky.is_earlier_profile(&lines.replacen("\toutput \"X Y Z\" disable\n", "", 1)));
     }
 
     /// A profile for two identical monitors as written before they were told
@@ -2399,6 +2659,7 @@ async fn save_profile(
     fs::create_dir_all(&kanshi_paths.profiles)
         .and_then(|_| fs::write(kanshi_paths.profiles.join(profile_name), profile_buf))
         .map_err(|e| zbus::fdo::Error::IOError(e.to_string()))?;
+    remove_superseded_profile(&kanshi_paths, manager_obj, profile_name);
     // An older profile for the same identical monitors names one output
     // twice and would still keep kanshi from loading any profile.
     set_aside_invalid_profiles(&kanshi_paths);

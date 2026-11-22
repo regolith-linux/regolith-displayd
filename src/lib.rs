@@ -1,6 +1,7 @@
 pub mod confirm;
 pub mod edid;
 pub mod gamma;
+pub mod kanshi;
 pub mod labels;
 pub mod modes;
 pub mod monitor;
@@ -211,18 +212,7 @@ impl DisplayServer {
             .map(|logical| logical.connector().to_string())
             .unwrap_or_default();
 
-        let (profile_name, mut profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
-        if let Some(monitor) = manager_obj
-            .monitors
-            .iter()
-            .find(|monitor| monitor.connector() == primary)
-        {
-            let line = format!(
-                "{PRIMARY_OUTPUT} \"{}\"\n",
-                monitor.kanshi_name(&manager_obj.monitors)
-            );
-            profile_buf.splice(0..0, line.into_bytes());
-        }
+        let (profile_name, profile_buf) = manager_obj.saved_profile(&mutter_logical_monitors);
         let commands = manager_obj.sway_commands(&mutter_logical_monitors);
         // What a revert goes back to: the outputs as they are now, which may
         // be a persistent change still awaiting an answer, as in GNOME.
@@ -400,9 +390,10 @@ impl DisplayManager {
     /// its file name and its contents.
     ///
     /// Each monitor is named by its description, or by its connector name if
-    /// another connected monitor has the same description (see
-    /// [`Monitor::kanshi_name`]). The file name joins those names, sorted, so
-    /// the same set of monitors always maps to the same file.
+    /// another connected monitor has the same description or kanshi cannot
+    /// read the description back as it is (see [`Monitor::named_by_connector`]).
+    /// The file name joins those names, sorted, so the same set of monitors
+    /// always maps to the same file.
     ///
     /// A connector name says nothing about the monitor plugged into it, so a
     /// profile that uses one also records which monitor it was saved for, in
@@ -421,7 +412,9 @@ impl DisplayManager {
         for (connector, description) in &pinned {
             writeln!(
                 &mut profile_buf,
-                "{PINNED_OUTPUT} \"{connector}\" is \"{description}\""
+                "{PINNED_OUTPUT} {} is {}",
+                kanshi::quote(connector),
+                kanshi::quote(description)
             )
             .unwrap();
         }
@@ -449,6 +442,24 @@ impl DisplayManager {
             .expect("Failed to write to file");
         }
         writeln!(&mut profile_buf, "}}").unwrap();
+        (profile_name, profile_buf)
+    }
+
+    /// The kanshi profile saved for `config`, as [`DisplayManager::kanshi_profile`]
+    /// writes it, after a comment that records which monitor is primary.
+    fn saved_profile(&self, config: &[MonitorApply]) -> (String, Vec<u8>) {
+        let (profile_name, mut profile_buf) = self.kanshi_profile(config);
+        let primary = config
+            .iter()
+            .find(|logical| logical.is_primary())
+            .and_then(|logical| logical.search_monitor(&self.monitors));
+        if let Some(monitor) = primary {
+            let line = format!(
+                "{PRIMARY_OUTPUT} {}\n",
+                kanshi::quote(&monitor.kanshi_name(&self.monitors))
+            );
+            profile_buf.splice(0..0, line.into_bytes());
+        }
         (profile_name, profile_buf)
     }
 
@@ -487,9 +498,14 @@ impl DisplayManager {
         let profile = fs::read_to_string(paths.profiles.join(profile_name)).ok()?;
         let name = profile.lines().find_map(|line| {
             let rest = line.trim().strip_prefix(PRIMARY_OUTPUT)?.trim();
-            rest.strip_prefix('"')?
-                .strip_suffix('"')
-                .map(str::to_string)
+            match kanshi::unquote(rest) {
+                Some((name, "")) => Some(name),
+                // As earlier versions wrote it, unescaped.
+                _ => rest
+                    .strip_prefix('"')?
+                    .strip_suffix('"')
+                    .map(str::to_string),
+            }
         })?;
         self.monitors
             .iter()
@@ -862,6 +878,14 @@ fn pinned_outputs(profile: &str) -> Vec<(String, String)> {
         .lines()
         .filter_map(|line| {
             let rest = line.strip_prefix(PINNED_OUTPUT)?.trim();
+            let quoted = kanshi::unquote(rest).and_then(|(connector, rest)| {
+                let (description, rest) = kanshi::unquote(rest.strip_prefix(" is ")?)?;
+                rest.is_empty().then_some((connector, description))
+            });
+            if quoted.is_some() {
+                return quoted;
+            }
+            // As earlier versions wrote it, unescaped.
             let (connector, description) = rest.split_once("\" is \"")?;
             let connector = connector.strip_prefix('"')?;
             let description = description.strip_suffix('"')?;
@@ -1201,14 +1225,17 @@ mod tests {
         .unwrap()
     }
 
-    fn profile(monitors: Vec<Monitor>, config: &[MonitorApply]) -> (String, String) {
-        let manager = DisplayManager {
+    fn manager_for(monitors: Vec<Monitor>) -> DisplayManager {
+        DisplayManager {
             serial: 0,
             monitors,
             logical_monitors: Vec::new(),
             properties: DisplayManagerProperties::new(),
-        };
-        let (name, contents) = manager.kanshi_profile(config);
+        }
+    }
+
+    fn profile(monitors: Vec<Monitor>, config: &[MonitorApply]) -> (String, String) {
+        let (name, contents) = manager_for(monitors).kanshi_profile(config);
         (name, String::from_utf8(contents).unwrap())
     }
 
@@ -1281,6 +1308,118 @@ mod tests {
              \toutput \"BOE 0x0BCA Unknown\" disable\n\
              }\n"
         );
+    }
+
+    /// Monitors whose descriptions kanshi cannot read back as they are: a
+    /// newline that would end the profile and start another, double quotes,
+    /// a tab, pattern characters, a backslash and a leading "$"; and one with
+    /// slashes, which kanshi reads as they are.
+    fn unusual_monitors() -> Vec<Monitor> {
+        vec![
+            monitor(
+                "DP-1",
+                "Acme\"\n}\nprofile {\n\toutput \"*\" disable",
+                "M1",
+                "S1",
+            ),
+            monitor("DP-2", "$work", "View[24]", "S*1 \\"),
+            monitor("DP-3", "../Acme", "M/1", "S1"),
+            monitor("HDMI-A-1", "Acme \"Pro\"", "M\t1", "S1"),
+        ]
+    }
+
+    #[test]
+    fn unusual_descriptions_cannot_add_to_the_profile() {
+        let monitors = unusual_monitors();
+        let (_, contents) = profile(
+            monitors.clone(),
+            &[place("DP-1", 0), place("DP-2", 1920), place("DP-3", 3840)],
+        );
+        assert_eq!(
+            contents,
+            "# regolith-displayd: output \"DP-1\" is \"Acme\\\"\\u{a}}\\u{a}profile {\\u{a}\\u{9}output \\\"*\\\" disable M1 S1\"\n\
+             # regolith-displayd: output \"DP-2\" is \"$work View[24] S*1 \\\\\"\n\
+             # regolith-displayd: output \"HDMI-A-1\" is \"Acme \\\"Pro\\\" M\\u{9}1 S1\"\n\
+             profile {\n\
+             \toutput \"DP-1\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+             \toutput \"DP-2\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
+             \toutput \"../Acme M/1 S1\" mode 1920x1080@60Hz position 3840,0 transform normal scale 1 enable\n\
+             \toutput \"HDMI-A-1\" disable\n\
+             }\n"
+        );
+        assert_eq!(
+            pinned_outputs(&contents),
+            [
+                ("DP-1".to_string(), monitors[0].get_dpy_name()),
+                ("DP-2".to_string(), monitors[1].get_dpy_name()),
+                ("HDMI-A-1".to_string(), monitors[3].get_dpy_name())
+            ]
+        );
+        // As earlier versions wrote it.
+        assert_eq!(
+            pinned_outputs("# regolith-displayd: output \"DP-1\" is \"Acme \\ M1 S1\"\n"),
+            [("DP-1".to_string(), "Acme \\ M1 S1".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_primary_monitor_is_read_back_whatever_its_description() {
+        let dir =
+            std::env::temp_dir().join(format!("displayd-primary-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = KanshiPaths {
+            profiles: dir.join("profiles"),
+            config: dir.join("config"),
+        };
+        fs::create_dir_all(&paths.profiles).unwrap();
+        let manager = manager_for(vec![
+            monitor("DP-1", "Acme \"Pro\"", "M\n1", "S1"),
+            monitor("DP-2", "Écran", "{1} #2 'x' ]", "S1"),
+        ]);
+        for primary in ["DP-1", "DP-2"] {
+            let config = [
+                arrange("DP-1", 0, primary == "DP-1"),
+                arrange("DP-2", 1920, primary == "DP-2"),
+            ];
+            let (name, contents) = manager.saved_profile(&config);
+            fs::write(paths.profiles.join(name), contents).unwrap();
+            assert_eq!(manager.saved_primary(&paths).as_deref(), Some(primary));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `connector` at `x`, primary or not, as the Displays panel applies it.
+    fn arrange(connector: &str, x: i32, primary: bool) -> MonitorApply {
+        serde_json::from_value(serde_json::json!({
+            "x_pos": x, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": primary,
+            "monitors": [[connector, "1920x1080@60Hz", {}]]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn kanshi_reads_profiles_for_unusual_monitors() {
+        let kanshi = Path::new("/usr/bin/kanshi");
+        if !kanshi.exists() {
+            eprintln!("skipping, kanshi is not installed");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("displayd-kanshi-unusual-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (_, contents) = profile(
+            unusual_monitors(),
+            &[place("DP-1", 0), place("DP-2", 1920), place("DP-3", 3840)],
+        );
+        let config = dir.join("config");
+        fs::write(&config, contents).unwrap();
+        let stderr = kanshi_parse(kanshi, &dir, &config);
+        assert!(
+            stderr.contains("failed to connect to display"),
+            "kanshi rejected the profile: {stderr}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A profile for two identical monitors as written before they were told

@@ -1,4 +1,5 @@
 use crate::edid;
+use crate::kanshi;
 use crate::modes::Modes;
 use log::warn;
 use num;
@@ -147,21 +148,30 @@ impl Monitor {
         &self.description.0
     }
 
-    /// How a kanshi profile names this monitor, given all the `connected`
-    /// monitors: by its description ("make model serial"), which follows the
-    /// monitor to any port, unless another connected monitor has the same
-    /// description. Then by its connector name (e.g. "DP-1"), because kanshi
-    /// rejects the whole configuration when a profile names an output twice.
-    pub fn kanshi_name(&self, connected: &[Monitor]) -> String {
+    /// Whether a kanshi profile names this monitor by its connector name
+    /// (e.g. "DP-1"), given all the `connected` monitors, rather than by its
+    /// description ("make model serial"), which follows the monitor to any
+    /// port: when another connected monitor has the same description, because
+    /// kanshi rejects the whole configuration when a profile names an output
+    /// twice, or when kanshi cannot read the description back as it is (see
+    /// [`kanshi::is_verbatim_output_name`]).
+    pub fn named_by_connector(&self, connected: &[Monitor]) -> bool {
         let description = self.get_dpy_name();
         let same = connected
             .iter()
             .filter(|monitor| monitor.get_dpy_name() == description)
             .count();
-        if same > 1 {
+        same > 1 || !kanshi::is_verbatim_output_name(&description)
+    }
+
+    /// How a kanshi profile names this monitor (see
+    /// [`Monitor::named_by_connector`]): by its connector name or by its
+    /// description, which is then written as it is.
+    pub fn kanshi_name(&self, connected: &[Monitor]) -> String {
+        if self.named_by_connector(connected) {
             self.description.0.clone()
         } else {
-            description
+            self.get_dpy_name()
         }
     }
 

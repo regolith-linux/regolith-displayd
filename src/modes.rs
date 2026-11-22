@@ -24,6 +24,10 @@ pub struct ModeProperties {
     interlaced: Option<bool>,
 }
 
+/// A mode as sway reports it: width, height and refresh rate in millihertz
+/// (0 when sway reports none).
+pub type ModeKey = (i32, i32, i32);
+
 impl Modes {
     pub fn get_id(&self) -> &str {
         &self.id
@@ -40,27 +44,35 @@ impl Modes {
             Some(x) => Self::is_current_mode(x, mode_info),
             _ => false,
         };
+        Modes::from_key((width, height, refresh)).with_current(is_current)
+    }
 
-        let properties = ModeProperties {
-            current: Some(is_current),
-            interlaced: Some(false),
-            preferred: Some(false),
-        };
-        let supported_scales = supported_scales(width, height);
+    /// The mode `key`, neither current nor preferred, with the id and scales
+    /// that sway reporting it would give it.
+    pub fn from_key((width, height, refresh): ModeKey) -> Modes {
+        let refresh_rate = f64::from(refresh) / 1000f64;
         Modes {
             width,
             height,
-            supported_scales,
-            id: format!(
-                "{}x{}@{}Hz",
-                mode_info.width,
-                mode_info.height,
-                (mode_info.refresh as f64) / 1000f64
-            ),
+            supported_scales: supported_scales(width, height),
+            id: format!("{width}x{height}@{refresh_rate}Hz"),
             preferred_scale: 1f64,
-            refresh_rate: (refresh as f64) / 1000f64,
-            properties,
+            refresh_rate,
+            properties: ModeProperties {
+                current: Some(false),
+                interlaced: Some(false),
+                preferred: Some(false),
+            },
         }
+    }
+
+    /// The mode as sway reports it (see [`Modes::from_key`]).
+    pub fn key(&self) -> ModeKey {
+        (
+            self.width,
+            self.height,
+            (self.refresh_rate * 1000f64).round() as i32,
+        )
     }
     pub fn get_modestr(&self) -> &str {
         &self.id
@@ -99,6 +111,14 @@ impl Modes {
     }
     pub fn current(&self) -> bool {
         self.properties.current == Some(true)
+    }
+    /// This mode, marked preferred or not.
+    pub fn with_preferred(mut self, preferred: bool) -> Modes {
+        self.properties.preferred = Some(preferred);
+        self
+    }
+    pub fn preferred(&self) -> bool {
+        self.properties.preferred == Some(true)
     }
 }
 
@@ -149,10 +169,33 @@ pub fn supported_scales(width: i32, height: i32) -> Vec<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::supported_scales;
+    use super::{supported_scales, Modes};
 
     fn approx(scales: Vec<f64>) -> Vec<String> {
         scales.iter().map(|s| format!("{s:.4}")).collect()
+    }
+
+    #[test]
+    fn a_mode_from_its_key_is_the_mode_sway_reports() {
+        let output: swayipc_async::Output = serde_json::from_value(serde_json::json!({
+            "id": 3, "name": "HEADLESS-1", "make": "Unknown", "model": "Unknown",
+            "serial": "Unknown", "active": true, "dpms": true, "primary": false,
+            "scale": 1.0, "transform": "normal",
+            "modes": [{"width": 1920, "height": 1080, "refresh": 59951}],
+            "current_mode": {"width": 1920, "height": 1080, "refresh": 59951},
+            "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}
+        }))
+        .unwrap();
+        let reported = Modes::new(&output, &output.modes[0]);
+        assert!(reported.current());
+        assert_eq!(reported.key(), (1920, 1080, 59951));
+        assert_eq!(Modes::from_key(reported.key()).with_current(true), reported);
+        assert_eq!(Modes::from_key((1920, 1080, 0)).get_id(), "1920x1080@0Hz");
+        assert_eq!(Modes::from_key((1920, 1080, 0)).sway_mode(), "1920x1080");
+        assert!(!Modes::from_key((1920, 1080, 0)).preferred());
+        assert!(Modes::from_key((1920, 1080, 0))
+            .with_preferred(true)
+            .preferred());
     }
 
     #[test]

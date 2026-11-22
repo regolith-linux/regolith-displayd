@@ -1,14 +1,17 @@
 pub mod confirm;
 pub mod edid;
 pub mod gamma;
+pub mod known_modes;
 pub mod labels;
 pub mod modes;
 pub mod monitor;
 pub mod night_light;
 
 use core::fmt;
+use known_modes::ModeHistory;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
+use modes::ModeKey;
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -36,6 +39,9 @@ lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
     /// The persistent change awaiting the user's answer, if any.
     static ref PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+    /// The mode of each monitor seen on, read when first needed.
+    static ref MODE_HISTORY: Mutex<ModeHistory> =
+        Mutex::new(ModeHistory::load(known_modes::history_path()));
 }
 
 /// How long the user has to keep a persistent change before it is reverted,
@@ -360,7 +366,8 @@ impl DisplayManager {
         }
     }
 
-    /// Follow sway's outputs: every 700 ms, store them if they changed (see
+    /// Follow sway's outputs: every 700 ms, remember the mode of each that is
+    /// on (see [`ModeHistory`]), store them if they changed (see
     /// [`DisplayManager::update`]), tell the Displays panel, and hold back or
     /// restore the profiles kept to particular monitors.
     pub async fn watch_changes(
@@ -380,6 +387,7 @@ impl DisplayManager {
                 debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
             }
             drop(manager_obj_lock);
+            remember_modes(&display_info.0).await;
             if changed {
                 Self::emit_monitors_changed().await?;
                 let kanshi_paths = get_kanshi_paths().await?;
@@ -577,7 +585,10 @@ impl DisplayManager {
         Ok(())
     }
 
-    /// Returns list of all monitors and logical monitors
+    /// Returns list of all monitors and logical monitors. A monitor that is
+    /// off and has no modes, reported by sway or known from earlier in this
+    /// run, is offered the mode it was last in while on, or else those its
+    /// saved kanshi profiles set (see `recover_modes`).
     pub async fn get_monitor_info(
         &mut self,
         sway_connection: &Mutex<Connection>,
@@ -586,6 +597,9 @@ impl DisplayManager {
         let (mut monitors, logical_monitors) = Self::monitors_of(&outputs);
         for monitor in &mut monitors {
             monitor.keep_known_modes(&self.monitors);
+        }
+        if monitors.iter().any(Monitor::has_no_modes) {
+            recover_modes(&mut monitors).await;
         }
         Ok((monitors, logical_monitors))
     }
@@ -638,6 +652,59 @@ fn same_monitors(a: &[Monitor], b: &[Monitor]) -> bool {
     a.len() == b.len()
         && a.iter()
             .all(|monitor| b.iter().any(|other| other.same_monitor(monitor)))
+}
+
+/// Offer modes for those of `monitors` that are off with no modes, so that
+/// the Displays panel can switch them back on: the mode the monitor was last
+/// in while it was on, else the modes its saved kanshi profiles set, else
+/// [`known_modes::FALLBACK_MODE`].
+async fn recover_modes(monitors: &mut [Monitor]) {
+    let history = MODE_HISTORY.lock().await;
+    for monitor in monitors.iter_mut().filter(|monitor| monitor.has_no_modes()) {
+        if let Some(mode) = history.mode(monitor.identity()) {
+            offer_recovered_modes(monitor, &[mode]);
+        }
+    }
+    drop(history);
+    if !monitors.iter().any(Monitor::has_no_modes) {
+        return;
+    }
+    // Never seen on since the history was started: what the saved profiles
+    // set for it.
+    let profiles = match get_kanshi_paths().await {
+        Ok(paths) => Some(paths.profiles),
+        Err(e) => {
+            warn!("Cannot read the kanshi profiles for the modes of monitors that are off: {e}");
+            None
+        }
+    };
+    for monitor in monitors.iter_mut().filter(|monitor| monitor.has_no_modes()) {
+        let mut modes = profiles.as_deref().map_or_else(Vec::new, |profiles| {
+            known_modes::profile_modes(profiles, &monitor.get_dpy_name(), monitor.connector())
+        });
+        if modes.is_empty() {
+            modes.push(known_modes::FALLBACK_MODE);
+        }
+        offer_recovered_modes(monitor, &modes);
+    }
+}
+
+fn offer_recovered_modes(monitor: &mut Monitor, modes: &[ModeKey]) {
+    info!(
+        "Output {} is off and sway reports no modes for it: offering {modes:?}",
+        monitor.connector()
+    );
+    monitor.offer_modes(modes);
+}
+
+/// Remember the mode of each of `monitors` that is on (see [`ModeHistory`]).
+async fn remember_modes(monitors: &[Monitor]) {
+    let mut history = MODE_HISTORY.lock().await;
+    for monitor in monitors {
+        if let Some(mode) = monitor.current_mode_key() {
+            history.remember(monitor.identity(), mode);
+        }
+    }
 }
 
 impl Default for DisplayManagerProperties {

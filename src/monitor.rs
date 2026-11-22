@@ -1,5 +1,5 @@
 use crate::edid;
-use crate::modes::Modes;
+use crate::modes::{ModeKey, Modes};
 use log::warn;
 use num;
 use num_derive::FromPrimitive;
@@ -12,9 +12,12 @@ use tokio::sync::Mutex;
 use zbus::fdo::Error::{self as ZError, Failed};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
+/// A monitor as sway identifies it: connector, make, model and serial.
+pub type MonitorId = (String, String, String, String);
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct Monitor {
-    description: (String, String, String, String),
+    description: MonitorId,
     modes: Vec<Modes>,
     properties: MonitorProperties,
 }
@@ -26,7 +29,7 @@ pub struct LogicalMonitor {
     scale: f64,
     transform: u32,
     primary: bool, // false always for wayland
-    monitors: Vec<(String, String, String, String)>,
+    monitors: Vec<MonitorId>,
     properties: LogicalMonitorProperties,
 }
 
@@ -104,8 +107,8 @@ impl Monitor {
         }
     }
 
-    /// Report the modes `known` gives for this monitor, none of them
-    /// current, if sway reports none: sway reports no mode for a headless or
+    /// Report the modes `known` gives for this monitor if sway reports none
+    /// (see [`Monitor::offer_modes`]): sway reports no mode for a headless or
     /// other virtual output that is off, and without one it couldn't be
     /// switched on again.
     pub fn keep_known_modes(&mut self, known: &[Monitor]) {
@@ -113,12 +116,45 @@ impl Monitor {
             return;
         }
         if let Some(previous) = known.iter().find(|monitor| monitor.same_monitor(self)) {
-            self.modes = previous
-                .modes
-                .iter()
-                .map(|mode| mode.clone().with_current(false))
-                .collect();
+            self.offer_modes(&previous.mode_keys());
         }
+    }
+
+    /// Whether the monitor lists no mode.
+    pub fn has_no_modes(&self) -> bool {
+        self.modes.is_empty()
+    }
+
+    /// The mode the monitor is in, if it is on.
+    pub fn current_mode_key(&self) -> Option<ModeKey> {
+        self.modes
+            .iter()
+            .find(|mode| mode.current())
+            .map(Modes::key)
+    }
+
+    /// The modes this monitor lists, the current one first: the order in
+    /// which to offer them once it is off.
+    pub fn mode_keys(&self) -> Vec<ModeKey> {
+        let current = self.modes.iter().filter(|mode| mode.current());
+        let others = self.modes.iter().filter(|mode| !mode.current());
+        current.chain(others).map(Modes::key).collect()
+    }
+
+    /// List `modes` for this monitor, which is off: none of them current,
+    /// and the first one marked preferred, so that the Displays panel picks
+    /// it when it switches the monitor back on.
+    pub fn offer_modes(&mut self, modes: &[ModeKey]) {
+        self.modes = modes
+            .iter()
+            .enumerate()
+            .map(|(i, &key)| Modes::from_key(key).with_preferred(i == 0))
+            .collect();
+    }
+
+    /// The monitor as sway identifies it: connector, make, model and serial.
+    pub fn identity(&self) -> &MonitorId {
+        &self.description
     }
 
     pub fn search_modes(&self, mode_id: &str) -> Option<&Modes> {
@@ -179,7 +215,7 @@ impl Monitor {
     /// Equality and hashing both use it, so that equal values also hash the
     /// same, as `HashSet` requires. [`Monitor::same_monitor`] compares the
     /// identity alone.
-    fn state(&self) -> (&(String, String, String, String), &str) {
+    fn state(&self) -> (&MonitorId, &str) {
         (&self.description, self.get_current_mode())
     }
 
@@ -205,7 +241,7 @@ impl Hash for Monitor {
 
 /// What `LogicalMonitor::state` returns: x, y, scale bits, transform and the
 /// monitors shown.
-type LogicalMonitorState<'a> = (i32, i32, u64, u32, &'a [(String, String, String, String)]);
+type LogicalMonitorState<'a> = (i32, i32, u64, u32, &'a [MonitorId]);
 
 impl LogicalMonitor {
     /// The logical monitor's state: where it is, its scale and rotation, and
@@ -755,23 +791,60 @@ mod tests {
         assert_eq!(apply("1x1@1Hz", 0).sway_command(&monitor), None);
     }
 
-    #[test]
-    fn output_switched_off_keeps_its_known_modes() {
-        let on = Monitor::new(&output("[]"));
-        let mut off = Monitor::new(
+    /// HEADLESS-1 switched off: sway reports no mode for it.
+    fn off_output() -> Monitor {
+        Monitor::new(
             &serde_json::from_str(
                 r#"{"id": 3, "name": "HEADLESS-1", "make": "Unknown", "model": "Unknown",
                     "serial": "Unknown", "active": false, "dpms": false, "primary": false,
                     "modes": [], "rect": {"x": 0, "y": 0, "width": 0, "height": 0}}"#,
             )
             .unwrap(),
-        );
-        assert!(off.modes.is_empty());
+        )
+    }
+
+    #[test]
+    fn output_switched_off_keeps_its_known_modes() {
+        let on = Monitor::new(&output("[]"));
+        let mut off = off_output();
+        assert!(off.has_no_modes());
         off.keep_known_modes(&[on]);
         assert_eq!(off.modes.len(), 1);
         assert_eq!(off.modes[0].get_id(), "1600x1000@0Hz");
         assert!(!off.modes[0].current());
+        assert!(off.modes[0].preferred());
         assert_eq!(off.get_current_mode(), "Unknown");
+    }
+
+    #[test]
+    fn output_switched_off_offers_its_last_mode_first() {
+        // On in 1600x1000, which sway lists second.
+        let on = Monitor::new(&output(
+            r#"[{"width": 1920, "height": 1080, "refresh": 60000},
+                {"width": 1600, "height": 1000, "refresh": 0}]"#,
+        ));
+        assert_eq!(on.mode_keys(), [(1600, 1000, 0), (1920, 1080, 60000)]);
+        let mut off = off_output();
+        off.keep_known_modes(&[on]);
+        let ids: Vec<&str> = off.modes.iter().map(|m| m.get_id()).collect();
+        assert_eq!(ids, ["1600x1000@0Hz", "1920x1080@60Hz"]);
+        let preferred: Vec<bool> = off.modes.iter().map(|m| m.preferred()).collect();
+        assert_eq!(preferred, [true, false]);
+        assert!(off.modes.iter().all(|m| !m.current()));
+        // Still off at the next look: the same list, in the same order.
+        let mut again = off_output();
+        again.keep_known_modes(&[off.clone()]);
+        assert_eq!(again.mode_keys(), off.mode_keys());
+        assert!(again.modes[0].preferred());
+    }
+
+    #[test]
+    fn another_monitor_gives_no_modes() {
+        let mut other = output("[]");
+        other.name = "HEADLESS-2".into();
+        let mut off = off_output();
+        off.keep_known_modes(&[Monitor::new(&other)]);
+        assert!(off.has_no_modes());
     }
 
     #[test]

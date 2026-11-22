@@ -392,6 +392,10 @@ impl LogicalMonitor {
         self.primary = primary;
     }
 
+    pub fn is_primary(&self) -> bool {
+        self.primary
+    }
+
     pub fn get_dpy_name(&self) -> String {
         let desc = &self.monitors[0];
         format!("{} {} {}", desc.1, desc.2, desc.3)

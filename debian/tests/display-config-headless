@@ -354,9 +354,22 @@ grep -q "output \"HEADLESS-1\" mode " "$profile" && grep -q "output \"$second\" 
     || fail "the profile does not name the outputs by connector: $(cat "$profile")"
 grep -qx "# regolith-displayd: output \"$second\" is \"$desc\"" "$profile" \
     || fail "the profile does not record the monitor on $second: $(cat "$profile")"
-[ ! -e "$profiles/$old_profile" ] && [ -f "$HOME/.config/regolith3/kanshi/invalid-profiles/$old_profile" ] \
-    || fail "the old profile that names \"$desc\" twice was not set aside"
-echo "ok: two identical outputs are saved by connector$([ "$scale_checks" = yes ] && echo " and their layout took effect"), the old profile was set aside"
+old_set_aside() {
+    [ ! -e "$profiles/$old_profile" ] && [ -f "$HOME/.config/regolith3/kanshi/invalid-profiles/$old_profile" ]
+}
+# regolith-displayd asks kanshi which profiles it refuses, which takes a
+# moment after the new profile is written. kanshi before 1.7 accepts an
+# output named twice: there the old profile stays.
+kanshi_version=$(dpkg-query -W -f '${Version}' kanshi)
+if dpkg --compare-versions "$kanshi_version" ge 1.7~; then
+    retry 20 old_set_aside || fail "the old profile that names \"$desc\" twice was not set aside"
+    old_result="the old profile was set aside"
+else
+    sleep 2
+    [ -f "$profiles/$old_profile" ] || fail "kanshi $kanshi_version accepts the old profile that names \"$desc\" twice, but it was set aside"
+    old_result="the old profile, which kanshi $kanshi_version accepts, stays"
+fi
+echo "ok: two identical outputs are saved by connector$([ "$scale_checks" = yes ] && echo " and their layout took effect"), $old_result"
 grep -qx "# regolith-displayd: primary \"$second\"" "$profile" \
     || fail "the profile does not record $second as primary: $(cat "$profile")"
 dc GetCurrentState | grep -qF "true, [('$second'," \

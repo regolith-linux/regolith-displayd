@@ -1,9 +1,78 @@
 //! Writing monitor descriptions into kanshi profiles, and into their file
 //! names, whatever make, model and serial number a monitor reports, for
-//! every kanshi version.
+//! every kanshi version; and asking kanshi whether it loads a configuration.
 
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
 use std::fmt::Write;
+use std::io::Read;
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long [`loads`] waits for kanshi to read a configuration.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A Wayland display that cannot be connected to: an absolute path, which
+/// libwayland connects to as it is, under a file that is not a directory.
+const NO_DISPLAY: &str = "/dev/null/regolith-displayd-config-check";
+
+/// Whether the `kanshi` executable loads the configuration file `config`,
+/// with everything it includes; None if that cannot be told, because kanshi
+/// cannot be run, does not finish in time (an include may name a FIFO) or
+/// is killed by a signal.
+///
+/// kanshi 1.2 and later read the configuration given with `-c`, includes
+/// and all, before they connect to the compositor, and stop with "failed to
+/// connect to display" if they cannot connect. So kanshi is run where it
+/// cannot connect, and does nothing but read the configuration: without
+/// `WAYLAND_SOCKET`, and with a `WAYLAND_DISPLAY` that does not exist. The
+/// configuration loads if kanshi gets that far. This asks the installed
+/// kanshi itself, whose syntax depends on its version. kanshi 1.1 ignores
+/// `-c` (see [`can_tell`]).
+pub fn loads(kanshi: &OsStr, config: &Path) -> Option<bool> {
+    let mut child = Command::new(kanshi)
+        .arg("-c")
+        .arg(config)
+        .env_remove("WAYLAND_SOCKET")
+        .env("WAYLAND_DISPLAY", NO_DISPLAY)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stderr = child.stderr.take()?;
+    let reader = thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stderr.read_to_end(&mut text);
+        text
+    });
+    let deadline = Instant::now() + LOAD_TIMEOUT;
+    let exited = loop {
+        match child.try_wait() {
+            // Killed, as by `pkill kanshi`: it did not get to say.
+            Ok(Some(status)) => break status.signal().is_none(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let stderr = reader.join().ok()?;
+    exited.then(|| String::from_utf8_lossy(&stderr).contains("failed to connect to display"))
+}
+
+/// Whether [`loads`] can tell anything with the `kanshi` executable: it
+/// loads an empty configuration. kanshi 1.1 reads its default configuration
+/// whatever it is given, and a program that never says "failed to connect
+/// to display" is not kanshi as [`loads`] knows it.
+pub fn can_tell(kanshi: &OsStr) -> bool {
+    loads(kanshi, Path::new("/dev/null")) == Some(true)
+}
 
 /// Whether every kanshi version reads `description`, written as an output
 /// name between double quotes, as exactly that description, and matches no

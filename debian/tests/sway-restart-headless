@@ -1,0 +1,114 @@
+#!/bin/bash
+# When sway goes away, regolith-displayd must exit with a failure status
+# within a few seconds, so that the service's Restart=on-failure starts it
+# again, instead of serving the outputs of a sway that is gone. Started again
+# with a new sway, it must serve the new sway's outputs.
+set -euo pipefail
+
+work=$(mktemp -d)
+export HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+unset WAYLAND_DISPLAY SWAYSOCK DISPLAY DBUS_SESSION_BUS_ADDRESS
+pids=()
+
+cleanup() {
+    kill "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*"
+    for log in "$work"/*.log; do
+        echo "--- $log"
+        tail -n 40 "$log"
+    done
+    exit 1
+}
+
+# retry <tries, 0.5 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+state() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method org.gnome.Mutter.DisplayConfig.GetCurrentState
+}
+
+serves() {
+    state 2> /dev/null | grep -q "'$1'"
+}
+
+# start_sway <name> <config lines...>: sets $sway, SWAYSOCK and WAYLAND_DISPLAY.
+start_sway() {
+    local name=$1
+    shift
+    printf '%s\n' "xwayland disable" "$@" > "$work/$name.cfg"
+    sway -c "$work/$name.cfg" > "$work/$name.log" 2>&1 &
+    sway=$!
+    pids+=("$sway")
+    retry 60 test -S "$XDG_RUNTIME_DIR/sway-ipc.$(id -u).$sway.sock" || fail "$name did not start"
+    SWAYSOCK="$XDG_RUNTIME_DIR/sway-ipc.$(id -u).$sway.sock"
+    export SWAYSOCK
+    retry 20 swaymsg -t get_outputs > /dev/null || fail "$name IPC not ready"
+    # A killed sway leaves its wayland socket behind: ask this one for its own.
+    rm -f "$work/wayland-display"
+    swaymsg -q exec "echo \$WAYLAND_DISPLAY > $work/wayland-display"
+    retry 20 test -s "$work/wayland-display" || fail "$name has no wayland socket"
+    WAYLAND_DISPLAY=$(cat "$work/wayland-display")
+    export WAYLAND_DISPLAY
+}
+
+start_displayd() {
+    regolith-displayd-init > /dev/null
+    RUST_LOG=info regolith-displayd > "$work/$1.log" 2>&1 &
+    displayd=$!
+    pids+=("$displayd")
+}
+
+dbus-daemon --session --nofork --print-address=1 > "$work/bus" 2> "$work/dbus.log" &
+pids+=($!)
+retry 20 test -s "$work/bus" || fail "dbus-daemon did not start"
+DBUS_SESSION_BUS_ADDRESS=$(head -n 1 "$work/bus")
+export DBUS_SESSION_BUS_ADDRESS
+
+start_sway sway "output HEADLESS-1 mode 1600x1000"
+start_displayd displayd
+retry 40 serves HEADLESS-1 || fail "regolith-displayd does not serve HEADLESS-1"
+echo "ok: regolith-displayd serves HEADLESS-1"
+
+# sway crashes.
+kill -KILL "$sway"
+wait "$sway" 2> /dev/null || true
+killed=$(date +%s%N)
+retry 10 sh -c "! kill -0 $displayd 2> /dev/null" \
+    || fail "regolith-displayd still runs 5 s after sway went away; it serves: $(state 2>&1 | head -c 300)"
+status=0
+wait "$displayd" || status=$?
+elapsed=$(( ($(date +%s%N) - killed) / 1000000 ))
+[ "$status" -ne 0 ] || fail "regolith-displayd exited with status 0 after sway went away"
+echo "ok: regolith-displayd exited with status $status within ${elapsed} ms of sway going away"
+grep -q "Stopped following sway's outputs" "$work/displayd.log" \
+    || fail "regolith-displayd did not say why it exited"
+serves HEADLESS-1 && fail "org.gnome.Mutter.DisplayConfig is still served"
+echo "ok: nothing serves the outputs of the sway that is gone"
+
+# The service starts it again once sway is back, with other outputs.
+start_sway sway2 "output HEADLESS-1 mode 1280x720"
+swaymsg -q create_output || fail "sway cannot create a headless output"
+start_displayd displayd2
+retry 40 serves HEADLESS-2 || fail "the restarted regolith-displayd does not serve HEADLESS-2: $(state 2>&1 | head -c 300)"
+state | grep -q "'1280x720@" || fail "the restarted regolith-displayd does not serve the 1280x720 mode"
+echo "ok: the restarted regolith-displayd serves the new sway's outputs"
+echo "PASS"

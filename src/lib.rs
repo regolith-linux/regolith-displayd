@@ -141,6 +141,10 @@ impl DisplayServer {
     /// configuration from just before it comes back. Any change replaces a
     /// persistent one still awaiting an answer, which then stays as it is,
     /// unsaved, as in GNOME.
+    ///
+    /// MonitorsChanged is emitted only if the change shows in
+    /// GetCurrentState: applying the configuration already in place changes
+    /// nothing.
     pub async fn apply_monitors_config(
         &self,
         serial: u32,
@@ -227,7 +231,9 @@ impl DisplayServer {
             profile_buf.splice(0..0, line.into_bytes());
         }
         let commands = manager_obj.sway_commands(&mutter_logical_monitors);
+        let before = manager_obj.clone();
         drop(manager_obj);
+        let before = reported_state(before, &self.primary).await;
         // What a revert goes back to: the outputs as they are now, which may
         // be a persistent change still awaiting an answer, as in GNOME.
         let previous = match outputs {
@@ -268,6 +274,7 @@ impl DisplayServer {
             .lock()
             .await
             .replace((monitor_set(&manager_obj.monitors), primary));
+        let after = manager_obj.clone();
         drop(manager_obj);
         let mut ready = None;
         if method == 2 {
@@ -293,8 +300,11 @@ impl DisplayServer {
             tokio::spawn(confirmation.run(cancel_rx, ready_tx));
             ready = Some(ready_rx);
         }
+        let changed = !reports_alike(&reported_state(after, &self.primary).await, &before);
         drop(turn);
-        DisplayManager::emit_monitors_changed().await?;
+        if changed {
+            DisplayManager::emit_monitors_changed().await?;
+        }
         // Reply once the prompt can take the answer: the caller may press
         // Enter as soon as the call returns.
         if let Some(ready) = ready {
@@ -830,6 +840,20 @@ async fn reported_state(
     };
     state.mark_primary(chosen.as_deref());
     state
+}
+
+/// Whether two states from [`reported_state`] report alike what an Apply or
+/// its revert can change: the serial, the mode of each monitor, the place,
+/// scale, rotation and monitors of each logical monitor, and which one is
+/// primary. (Comparing logical monitors leaves the primary out.)
+fn reports_alike(a: &DisplayManager, b: &DisplayManager) -> bool {
+    a.serial == b.serial
+        && a.monitors == b.monitors
+        && a.logical_monitors == b.logical_monitors
+        && a.logical_monitors
+            .iter()
+            .zip(&b.logical_monitors)
+            .all(|(x, y)| x.is_primary() == y.is_primary())
 }
 
 /// Refuse a configuration Mutter refuses
@@ -1873,6 +1897,36 @@ mod hotplug_tests {
     }
 
     #[test]
+    fn a_new_primary_alone_is_reported() {
+        let with_primary = |outputs: &[Output], primary: &str| {
+            let (monitors, logical_monitors) = state(outputs);
+            let mut manager = DisplayManager {
+                serial: 0,
+                monitors,
+                logical_monitors,
+                properties: DisplayManagerProperties::new(),
+            };
+            manager.mark_primary(Some(primary));
+            manager
+        };
+        let before = with_primary(&[dp1(), dp2()], "DP-1");
+        assert!(reports_alike(
+            &before,
+            &with_primary(&[dp1(), dp2()], "DP-1")
+        ));
+        // The logical monitors compare equal, but the panel shows the
+        // primary: an Apply that only moves it must be reported.
+        let moved = with_primary(&[dp1(), dp2()], "DP-2");
+        assert_eq!(before.logical_monitors, moved.logical_monitors);
+        assert!(!reports_alike(&before, &moved));
+        let scaled = with_primary(&[dp1(), sway_output("DP-2", 1920, 2.0, 1920)], "DP-1");
+        assert!(!reports_alike(&before, &scaled));
+        let mut next = with_primary(&[dp1(), dp2()], "DP-1");
+        next.serial = 1;
+        assert!(!reports_alike(&before, &next));
+    }
+
+    #[test]
     fn the_same_outputs_in_another_order_are_no_change() {
         let mut manager = reported(&[dp1(), dp2()]);
         let (monitors, logical_monitors) = state(&[dp2(), dp1()]);
@@ -2182,6 +2236,7 @@ impl Confirmation {
             *pending = None;
         }
         let state = self.manager.lock().await.clone();
+        let before = reported_state(state.clone(), &self.primary).await;
         if keep {
             info!("Configuration kept: saving profile {}", self.profile_name);
             if let Err(e) = save_profile(&state, &self.profile_name, &self.profile_buf).await {
@@ -2203,9 +2258,15 @@ impl Confirmation {
                 Err(e) => error!("Error getting output information from sway: {e}"),
             }
         }
+        let after = self.manager.lock().await.clone();
+        let changed = !reports_alike(&reported_state(after, &self.primary).await, &before);
         drop(turn);
-        if let Err(e) = DisplayManager::emit_monitors_changed().await {
-            error!("Error emitting MonitorsChanged: {e}");
+        // Keeping a change, or reverting one that changed nothing, changes
+        // nothing that GetCurrentState reports.
+        if changed {
+            if let Err(e) = DisplayManager::emit_monitors_changed().await {
+                error!("Error emitting MonitorsChanged: {e}");
+            }
         }
     }
 }

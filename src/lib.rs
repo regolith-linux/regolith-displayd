@@ -36,6 +36,11 @@ lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
     /// The persistent change awaiting the user's answer, if any.
     static ref PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+    /// Held by whatever changes sway's outputs or stores them: an Apply, the
+    /// keep or revert of a persistent change, and the watcher. So each of
+    /// them reads sway and stores what it read without another one changing
+    /// the outputs in between. GetCurrentState never takes it.
+    static ref CHANGE_TURN: Mutex<()> = Mutex::new(());
 }
 
 /// How long the user has to keep a persistent change before it is reverted,
@@ -119,21 +124,13 @@ pub struct KanshiPaths {
 
 #[dbus_interface(name = "org.gnome.Mutter.DisplayConfig")]
 impl DisplayServer {
-    pub async fn get_current_state(&mut self) -> DisplayManager {
+    // The methods take `&self`: zbus runs the `&mut self` methods of an
+    // interface one at a time, so GetCurrentState would wait for an Apply,
+    // and for the confirmation prompt the Apply waits for.
+    pub async fn get_current_state(&self) -> DisplayManager {
         info!("Recieved 'GetCurrentState' request from control-center");
-        let mut state = self.manager.lock().await.clone();
-        let remembered = self.primary.lock().await.clone();
-        let chosen = match &remembered {
-            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
-                Some(connector.clone())
-            }
-            _ => match get_kanshi_paths().await {
-                Ok(paths) => state.saved_primary(&paths),
-                Err(_) => None,
-            },
-        };
-        state.mark_primary(chosen.as_deref());
-        state
+        let state = self.manager.lock().await.clone();
+        reported_state(state, &self.primary).await
     }
 
     /// Verify (0), or apply at once, temporarily (1) or persistently (2).
@@ -145,7 +142,7 @@ impl DisplayServer {
     /// persistent one still awaiting an answer, which then stays as it is,
     /// unsaved, as in GNOME.
     pub async fn apply_monitors_config(
-        &mut self,
+        &self,
         serial: u32,
         method: u32,
         mutter_logical_monitors: Vec<MonitorApply>,
@@ -153,13 +150,19 @@ impl DisplayServer {
     ) -> zbus::fdo::Result<()> {
         let called = Instant::now();
         debug!("Configuration Method: {method}");
-        let mut manager_obj = self.manager.lock().await;
+        let turn = CHANGE_TURN.lock().await;
+        // sway is read, and told what to do, without holding the state, so
+        // that GetCurrentState answers even while sway is slow to.
+        let outputs = self.sway_connection.lock().await.get_outputs().await;
+        let manager_obj = self.manager.lock().await;
         // Monitors plugged in or unplugged since the watcher last looked:
         // the configuration was made for other monitors, so refuse it rather
         // than save it as their profile. The watcher reports the change,
         // moving the serial on, and the panel reads the new state.
-        match manager_obj.get_monitor_info(&self.sway_connection).await {
-            Ok((monitors, _)) if !same_monitors(&manager_obj.monitors, &monitors) => {
+        match &outputs {
+            Ok(outputs)
+                if !same_monitors(&manager_obj.monitors, &manager_obj.state_of(outputs).0) =>
+            {
                 error!("Invalid configuration recieved for method apply_monitors_config: the monitors changed");
                 return Err(zbus::fdo::Error::InvalidArgs(String::from(
                     "The monitors changed",
@@ -224,11 +227,17 @@ impl DisplayServer {
             profile_buf.splice(0..0, line.into_bytes());
         }
         let commands = manager_obj.sway_commands(&mutter_logical_monitors);
+        drop(manager_obj);
         // What a revert goes back to: the outputs as they are now, which may
         // be a persistent change still awaiting an answer, as in GNOME.
-        let previous = current_sway_commands(&self.sway_connection)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("Cannot read the outputs: {e}")))?;
+        let previous = match outputs {
+            Ok(outputs) => restore_commands(&outputs),
+            Err(e) => {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Cannot read the outputs: {e}"
+                )))
+            }
+        };
         if let Err(e) = run_sway(&self.sway_connection, &commands).await {
             error!("Error applying the configuration: {e}");
             if let Err(e) = run_sway(&self.sway_connection, &previous).await {
@@ -244,8 +253,11 @@ impl DisplayServer {
         if PENDING.lock().await.take().is_some() {
             info!("A newer configuration replaces the one awaiting confirmation");
         }
-        match manager_obj.get_monitor_info(&self.sway_connection).await {
-            Ok((monitors, logical_monitors)) => {
+        let outputs = self.sway_connection.lock().await.get_outputs().await;
+        let mut manager_obj = self.manager.lock().await;
+        match outputs {
+            Ok(outputs) => {
+                let (monitors, logical_monitors) = manager_obj.state_of(&outputs);
                 manager_obj.update(monitors, logical_monitors);
             }
             Err(e) => error!("Error getting output information from sway: {e}"),
@@ -256,6 +268,7 @@ impl DisplayServer {
             .lock()
             .await
             .replace((monitor_set(&manager_obj.monitors), primary));
+        drop(manager_obj);
         let mut ready = None;
         if method == 2 {
             let id = CONFIRMATIONS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -280,7 +293,7 @@ impl DisplayServer {
             tokio::spawn(confirmation.run(cancel_rx, ready_tx));
             ready = Some(ready_rx);
         }
-        drop(manager_obj);
+        drop(turn);
         DisplayManager::emit_monitors_changed().await?;
         // Reply once the prompt can take the answer: the caller may press
         // Enter as soon as the call returns.
@@ -328,12 +341,8 @@ impl DisplayServer {
         // and only those that fit the monitors connected now.
         let kanshi_paths = get_kanshi_paths().await?;
         set_aside_invalid_profiles(&kanshi_paths);
-        let (monitors, _) = self
-            .manager
-            .lock()
-            .await
-            .get_monitor_info(&self.sway_connection)
-            .await?;
+        let outputs = self.sway_connection.lock().await.get_outputs().await?;
+        let (monitors, _) = DisplayManager::monitors_of(&outputs);
         hold_profiles_for_other_monitors(&kanshi_paths, &connected_outputs(&monitors));
 
         let mut connection = ZBUS_CONNECTION.lock().await;
@@ -363,16 +372,18 @@ impl DisplayManager {
     /// Follow sway's outputs: every 700 ms, store them if they changed (see
     /// [`DisplayManager::update`]), tell the Displays panel, and hold back or
     /// restore the profiles kept to particular monitors.
+    ///
+    /// sway is read without holding the state, so that GetCurrentState
+    /// answers even while sway is slow to.
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
     ) -> Result<(), Box<dyn Error>> {
         loop {
+            let turn = CHANGE_TURN.lock().await;
+            let outputs = sway_connection.lock().await.get_outputs().await?;
             let mut manager_obj_lock = manager_obj.lock().await;
-            let display_info = manager_obj_lock
-                .get_monitor_info(&sway_connection)
-                .await
-                .unwrap();
+            let display_info = manager_obj_lock.state_of(&outputs);
             // A monitor that went away is a change too.
             let changed = manager_obj_lock.update(display_info.0.clone(), display_info.1.clone());
             if changed {
@@ -380,6 +391,7 @@ impl DisplayManager {
                 debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
             }
             drop(manager_obj_lock);
+            drop(turn);
             if changed {
                 Self::emit_monitors_changed().await?;
                 let kanshi_paths = get_kanshi_paths().await?;
@@ -577,17 +589,15 @@ impl DisplayManager {
         Ok(())
     }
 
-    /// Returns list of all monitors and logical monitors
-    pub async fn get_monitor_info(
-        &mut self,
-        sway_connection: &Mutex<Connection>,
-    ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
-        let outputs = sway_connection.lock().await.get_outputs().await?;
-        let (mut monitors, logical_monitors) = Self::monitors_of(&outputs);
+    /// The monitors and logical monitors of sway's `outputs`, with the modes
+    /// known for the monitors that report none (see
+    /// [`Monitor::keep_known_modes`]).
+    fn state_of(&self, outputs: &[Output]) -> (Vec<Monitor>, Vec<LogicalMonitor>) {
+        let (mut monitors, logical_monitors) = Self::monitors_of(outputs);
         for monitor in &mut monitors {
             monitor.keep_known_modes(&self.monitors);
         }
-        Ok((monitors, logical_monitors))
+        (monitors, logical_monitors)
     }
 
     /// The monitors of sway's `outputs`, and the logical monitors of the
@@ -787,6 +797,25 @@ fn monitor_set(monitors: &[Monitor]) -> Vec<String> {
     let mut set: Vec<String> = monitors.iter().map(|m| m.connector().to_string()).collect();
     set.sort();
     set
+}
+
+/// The state GetCurrentState reports for `state`, with exactly one primary
+/// marked: the one chosen by the last Apply (`remembered`) while the same
+/// monitors are connected, else the one saved with their profile.
+async fn reported_state(
+    mut state: DisplayManager,
+    remembered: &Mutex<Option<PrimaryChoice>>,
+) -> DisplayManager {
+    let remembered = remembered.lock().await.clone();
+    let chosen = match &remembered {
+        Some((set, connector)) if *set == monitor_set(&state.monitors) => Some(connector.clone()),
+        _ => match get_kanshi_paths().await {
+            Ok(paths) => state.saved_primary(&paths),
+            Err(_) => None,
+        },
+    };
+    state.mark_primary(chosen.as_deref());
+    state
 }
 
 /// Refuse a configuration Mutter refuses
@@ -2107,7 +2136,7 @@ impl Confirmation {
         if let Some(mut child) = prompt {
             let _ = child.kill().await;
         }
-        let mut manager_obj = self.manager.lock().await;
+        let turn = CHANGE_TURN.lock().await;
         {
             let mut pending = PENDING.lock().await;
             if pending.as_ref().map(|p| p.id) != Some(self.id) {
@@ -2115,10 +2144,10 @@ impl Confirmation {
             }
             *pending = None;
         }
+        let state = self.manager.lock().await.clone();
         if keep {
             info!("Configuration kept: saving profile {}", self.profile_name);
-            if let Err(e) = save_profile(&manager_obj, &self.profile_name, &self.profile_buf).await
-            {
+            if let Err(e) = save_profile(&state, &self.profile_name, &self.profile_buf).await {
                 error!("Error saving the kept configuration: {e}");
             }
         } else {
@@ -2127,14 +2156,17 @@ impl Confirmation {
                 error!("Error reverting the configuration: {e}");
             }
             *self.primary.lock().await = self.previous_primary;
-            match manager_obj.get_monitor_info(&self.sway_connection).await {
-                Ok((monitors, logical_monitors)) => {
+            let outputs = self.sway_connection.lock().await.get_outputs().await;
+            let mut manager_obj = self.manager.lock().await;
+            match outputs {
+                Ok(outputs) => {
+                    let (monitors, logical_monitors) = manager_obj.state_of(&outputs);
                     manager_obj.update(monitors, logical_monitors);
                 }
                 Err(e) => error!("Error getting output information from sway: {e}"),
             }
         }
-        drop(manager_obj);
+        drop(turn);
         if let Err(e) = DisplayManager::emit_monitors_changed().await {
             error!("Error emitting MonitorsChanged: {e}");
         }
@@ -2167,12 +2199,6 @@ fn spawn_prompt(output: &str, deadline: Instant) -> Option<tokio::process::Child
             None
         }
     }
-}
-
-/// The sway commands that bring the outputs back to how they are now.
-async fn current_sway_commands(sway: &Mutex<Connection>) -> Result<Vec<String>, Box<dyn Error>> {
-    let outputs = sway.lock().await.get_outputs().await?;
-    Ok(restore_commands(&outputs))
 }
 
 /// The sway commands that bring `outputs` back: the active ones first, with

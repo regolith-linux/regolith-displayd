@@ -1,0 +1,179 @@
+#!/bin/bash
+# What the Displays panel sees of the state on a headless sway:
+# - the first GetCurrentState, as soon as regolith-displayd has its name,
+#   reports the outputs at serial 0, and starting emits no MonitorsChanged;
+# - an Apply of the configuration already in place emits no MonitorsChanged,
+#   and one that changes it emits exactly one;
+# - GetCurrentState answers while sway does not, even with an Apply waiting
+#   for sway, and both go on once sway answers again.
+set -euo pipefail
+
+work=$(mktemp -d)
+export HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+unset WAYLAND_DISPLAY SWAYSOCK DISPLAY DBUS_SESSION_BUS_ADDRESS
+pids=()
+
+cleanup() {
+    if [ -n "${sway:-}" ]; then
+        kill -CONT "$sway" 2>/dev/null || true
+    fi
+    kill "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*"
+    for log in "$work"/*.log; do
+        echo "--- $log"
+        tail -n 40 "$log"
+    done
+    exit 1
+}
+
+# retry <tries, 0.5 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+dc() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method "org.gnome.Mutter.DisplayConfig.$1" "${@:2}"
+}
+
+serial() {
+    sed -E 's/^\(uint32 ([0-9]+),.*/\1/' <<< "$1"
+}
+
+# The scale of the one logical monitor in a GetCurrentState reply.
+scale() {
+    grep -oE '\[\(0, 0, [0-9.]+,' <<< "$1" | sed -E 's/.*, ([0-9.]+),$/\1/'
+}
+
+has_owner() {
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner org.gnome.Mutter.DisplayConfig \
+        2> /dev/null | grep -q true
+}
+
+signals() {
+    grep -c 'member=MonitorsChanged' "$work/monitor.log" || true
+}
+
+signals_are() {
+    [ "$(signals)" = "$1" ]
+}
+
+current_mode() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+out = next(o for o in json.load(sys.stdin) if o["name"] == "HEADLESS-1")
+mode = out["current_mode"]
+print("%dx%d@%gHz" % (mode["width"], mode["height"], mode["refresh"] / 1000))'
+}
+
+printf 'xwayland disable\noutput HEADLESS-1 mode 1600x1000 position 0 0 scale 1\n' > "$work/sway.cfg"
+sway -c "$work/sway.cfg" > "$work/sway.log" 2>&1 &
+sway=$!
+pids+=("$sway")
+retry 60 compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" > /dev/null || fail "sway did not start"
+SWAYSOCK=$(compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" | head -n 1)
+export SWAYSOCK
+retry 20 swaymsg -t get_outputs > /dev/null || fail "sway IPC not ready"
+
+dbus-daemon --session --nofork --print-address=1 > "$work/bus" 2> "$work/dbus.log" &
+pids+=($!)
+retry 20 test -s "$work/bus" || fail "dbus-daemon did not start"
+DBUS_SESSION_BUS_ADDRESS=$(head -n 1 "$work/bus")
+export DBUS_SESSION_BUS_ADDRESS
+
+dbus-monitor --session "type='signal',interface='org.gnome.Mutter.DisplayConfig',member='MonitorsChanged'" \
+    > "$work/monitor.log" 2>&1 &
+pids+=($!)
+sleep 1
+
+regolith-displayd-init > /dev/null
+RUST_LOG=info regolith-displayd > "$work/displayd.log" 2>&1 &
+displayd=$!
+pids+=("$displayd")
+for _ in $(seq 400); do
+    has_owner && break
+    kill -0 "$displayd" 2> /dev/null || fail "regolith-displayd exited"
+    sleep 0.025
+done
+has_owner || fail "regolith-displayd did not take its name"
+first=$(dc GetCurrentState) || fail "the first GetCurrentState failed"
+grep -qF "('HEADLESS-1', " <<< "$first" || fail "the first GetCurrentState has no outputs: $first"
+[ "$(serial "$first")" = 0 ] || fail "the first GetCurrentState has serial $(serial "$first"), not 0"
+echo "ok: the first GetCurrentState reports HEADLESS-1 at serial 0"
+sleep 2
+state=$(dc GetCurrentState)
+[ "$(serial "$state")" = 0 ] || fail "the serial moved to $(serial "$state") without any change"
+signals_are 0 || fail "$(signals) MonitorsChanged emitted without any change"
+echo "ok: starting moved no serial and emitted no MonitorsChanged"
+
+mode=$(current_mode)
+config() {
+    echo "[(0, 0, $1, 0, true, [('HEADLESS-1', '$mode', @a{sv} {})])]"
+}
+
+# The configuration already in place.
+dc ApplyMonitorsConfig 0 1 "$(config 1.0)" "@a{sv} {}" > /dev/null || fail "Apply of the current configuration failed"
+sleep 2
+state=$(dc GetCurrentState)
+signals_are 0 || fail "an Apply that changed nothing emitted $(signals) MonitorsChanged"
+[ "$(serial "$state")" = 0 ] || fail "an Apply that changed nothing moved the serial to $(serial "$state")"
+echo "ok: an Apply of the configuration in place emitted no MonitorsChanged"
+
+# A new scale.
+dc ApplyMonitorsConfig "$(serial "$state")" 1 "$(config 2.0)" "@a{sv} {}" > /dev/null || fail "Apply of scale 2 failed"
+retry 10 signals_are 1 || fail "an Apply of scale 2 emitted $(signals) MonitorsChanged, not 1"
+sleep 2
+signals_are 1 || fail "an Apply of scale 2 emitted $(signals) MonitorsChanged, not 1"
+state=$(dc GetCurrentState)
+[ "$(scale "$state")" = 2.0 ] || fail "GetCurrentState reports scale $(scale "$state") after an Apply of scale 2"
+echo "ok: an Apply of scale 2 emitted one MonitorsChanged"
+
+# sway stops answering: the watcher is left waiting for it.
+kill -STOP "$sway"
+sleep 2
+timeout 5 gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+    --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.gnome.Mutter.DisplayConfig.GetCurrentState > /dev/null \
+    || fail "GetCurrentState did not answer while sway was stopped"
+dc ApplyMonitorsConfig "$(serial "$state")" 1 "$(config 1.0)" "@a{sv} {}" > "$work/apply.out" 2>&1 &
+apply=$!
+sleep 1
+kill -0 "$apply" 2> /dev/null || fail "an Apply finished while sway was stopped: $(cat "$work/apply.out")"
+timeout 5 gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+    --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.gnome.Mutter.DisplayConfig.GetCurrentState > /dev/null \
+    || fail "GetCurrentState did not answer while an Apply waited for sway"
+echo "ok: GetCurrentState answers while sway does not, with an Apply waiting for sway"
+kill -CONT "$sway"
+for _ in $(seq 20); do
+    kill -0 "$apply" 2> /dev/null || break
+    sleep 0.5
+done
+if kill -0 "$apply" 2> /dev/null; then
+    fail "the Apply did not finish once sway answered again"
+fi
+wait "$apply" || fail "the Apply failed once sway answered again: $(cat "$work/apply.out")"
+retry 10 signals_are 2 || fail "$(signals) MonitorsChanged in all, not 2, after the Apply of scale 1"
+state=$(dc GetCurrentState)
+[ "$(scale "$state")" = 1.0 ] || fail "GetCurrentState reports scale $(scale "$state") after an Apply of scale 1"
+echo "ok: the Apply finished once sway answered again, with one MonitorsChanged"
+
+kill -0 "$displayd" || fail "regolith-displayd exited"
+echo "PASS"

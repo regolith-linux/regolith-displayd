@@ -186,12 +186,20 @@ pub fn earlier_profile_file_name(outputs: &[NamedOutput]) -> String {
 }
 
 /// Whether profile file names hold `text` as it is: ASCII letters and
-/// digits, spaces and ".-,+()" only, no two spaces in a row, no space at
-/// either end and no "." first. A make, model or serial number that is
-/// empty or starts or ends with a space makes the description not plain.
+/// digits, spaces and ".-,+()" only, no two spaces in a row, no space and
+/// no "." first. A make or model that is empty, or a make, model or serial
+/// number that starts or ends with a space, makes the description not plain.
+///
+/// An empty serial number alone leaves the description plain, though it
+/// then ends with a space: sway before 1.8 reports it so for monitors
+/// without one (every headless output, for one), and earlier versions named
+/// their profiles "Make_Model_". Names stay distinct: in the joined name a
+/// run of one "_" is a space, of two the "__" between monitors, of three a
+/// space that ends a monitor's name and then "__", and a "_" at the very end
+/// is a space that ends the last name, since no name starts with a space or
+/// holds two in a row.
 fn is_plain(text: &str) -> bool {
     !text.starts_with(['.', ' '])
-        && !text.ends_with(' ')
         && !text.contains("  ")
         && text
             .chars()
@@ -378,6 +386,13 @@ mod tests {
             ]),
             by_connector(&[("DP-1", "Acme View 24 0"), ("DP-2", "Acme View 24 0")]),
             by_description(&["Lenovo Group Limited 0x40BA (1,2+3) Unknown"]),
+            // An empty serial number, as sway before 1.8 reports it.
+            by_description(&["headless headless "]),
+            by_description(&["Acme View ", "BOE 0x0BCA Unknown"]),
+            by_connector(&[
+                ("HEADLESS-1", "headless headless "),
+                ("HEADLESS-2", "headless headless "),
+            ]),
         ] {
             assert_eq!(
                 profile_file_name(&outputs),
@@ -394,6 +409,13 @@ mod tests {
                 ("DP-1", "Acme View 24 0")
             ])),
             "zz-DP-1=Acme_View_24_0__DP-2=Acme_View_24_0"
+        );
+        assert_eq!(
+            profile_file_name(&by_connector(&[
+                ("HEADLESS-2", "headless headless "),
+                ("HEADLESS-1", "headless headless ")
+            ])),
+            "zz-HEADLESS-1=headless_headless___HEADLESS-2=headless_headless_"
         );
     }
 
@@ -420,6 +442,16 @@ mod tests {
             by_description(&["../Acme M/1 S1"]),
             by_description(&["Écran 显示器 S1"]),
             by_description(&["Acme ~ S1"]),
+            by_description(&["A B ", "C D"]),
+            by_description(&["A B", "C D "]),
+            by_description(&["A B ", "C D "]),
+            by_description(&["A B", " C D"]),
+            by_description(&["A B   C D"]),
+            by_description(&["A B ", " C D"]),
+            by_description(&["A B C "]),
+            by_description(&["A B C"]),
+            by_connector(&[("DP-1", "A B "), ("DP-2", "A B ")]),
+            by_connector(&[("DP-1", "A B"), ("DP-2", "A B")]),
         ];
         let names: Vec<String> = sets.iter().map(|set| profile_file_name(set)).collect();
         let distinct: std::collections::HashSet<&String> = names.iter().collect();
@@ -435,6 +467,9 @@ mod tests {
         }
         assert_eq!(names[1], "Acme_View%5F24_0");
         assert_eq!(names[13], "%20Acme_View_S1%20");
+        assert_eq!(names[16], "Acme_View_S1_");
+        assert_eq!(names[20], "A_B___C_D");
+        assert_eq!(names[21], "A_B__C_D_");
         assert_eq!(names[17], "%2E.%2FAcme_M%2F1_S1");
         assert_eq!(names[18], "%C3%89cran_%E6%98%BE%E7%A4%BA%E5%99%A8_S1");
         // Monitors named by their descriptions can swap connectors.

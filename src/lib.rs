@@ -1,19 +1,23 @@
 pub mod confirm;
 pub mod edid;
 pub mod gamma;
+pub mod kanshi;
 pub mod labels;
 pub mod modes;
 pub mod monitor;
 pub mod night_light;
 
 use core::fmt;
+use kanshi::NamedOutput;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::hash::Hash;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +40,11 @@ lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
     /// The persistent change awaiting the user's answer, if any.
     static ref PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+    /// Held while the kanshi profiles are changed and kanshi is reloaded, so
+    /// that a reload never stops the kanshi that checks the profiles (see
+    /// [`set_aside_invalid_profiles`]), and two changes never interleave.
+    /// Taken after the manager, never before.
+    static ref KANSHI_PROFILES: Mutex<()> = Mutex::new(());
 }
 
 /// How long the user has to keep a persistent change before it is reverted,
@@ -112,6 +121,7 @@ pub struct ServerError {
     description: String,
 }
 
+#[derive(Clone)]
 pub struct KanshiPaths {
     profiles: PathBuf,
     config: PathBuf,
@@ -211,18 +221,7 @@ impl DisplayServer {
             .map(|logical| logical.connector().to_string())
             .unwrap_or_default();
 
-        let (profile_name, mut profile_buf) = manager_obj.kanshi_profile(&mutter_logical_monitors);
-        if let Some(monitor) = manager_obj
-            .monitors
-            .iter()
-            .find(|monitor| monitor.connector() == primary)
-        {
-            let line = format!(
-                "{PRIMARY_OUTPUT} \"{}\"\n",
-                monitor.kanshi_name(&manager_obj.monitors)
-            );
-            profile_buf.splice(0..0, line.into_bytes());
-        }
+        let (profile_name, profile_buf) = manager_obj.saved_profile(&mutter_logical_monitors);
         let commands = manager_obj.sway_commands(&mutter_logical_monitors);
         // What a revert goes back to: the outputs as they are now, which may
         // be a persistent change still awaiting an answer, as in GNOME.
@@ -327,14 +326,16 @@ impl DisplayServer {
         // kanshi starts after this daemon: make sure it can load the profiles,
         // and only those that fit the monitors connected now.
         let kanshi_paths = get_kanshi_paths().await?;
-        set_aside_invalid_profiles(&kanshi_paths);
         let (monitors, _) = self
             .manager
             .lock()
             .await
             .get_monitor_info(&self.sway_connection)
             .await?;
+        let profiles = KANSHI_PROFILES.lock().await;
+        set_aside_invalid_profiles(&kanshi_paths).await;
         hold_profiles_for_other_monitors(&kanshi_paths, &connected_outputs(&monitors));
+        drop(profiles);
 
         let mut connection = ZBUS_CONNECTION.lock().await;
         *connection = Some(
@@ -383,6 +384,7 @@ impl DisplayManager {
             if changed {
                 Self::emit_monitors_changed().await?;
                 let kanshi_paths = get_kanshi_paths().await?;
+                let _profiles = KANSHI_PROFILES.lock().await;
                 if hold_profiles_for_other_monitors(
                     &kanshi_paths,
                     &connected_outputs(&display_info.0),
@@ -400,9 +402,10 @@ impl DisplayManager {
     /// its file name and its contents.
     ///
     /// Each monitor is named by its description, or by its connector name if
-    /// another connected monitor has the same description (see
-    /// [`Monitor::kanshi_name`]). The file name joins those names, sorted, so
-    /// the same set of monitors always maps to the same file.
+    /// another connected monitor has the same description or kanshi cannot
+    /// read the description back as it is (see [`Monitor::named_by_connector`]).
+    /// The file name joins those names, sorted, so the same set of monitors
+    /// always maps to the same file (see [`kanshi::profile_file_name`]).
     ///
     /// A connector name says nothing about the monitor plugged into it, so a
     /// profile that uses one also records which monitor it was saved for, in
@@ -421,7 +424,9 @@ impl DisplayManager {
         for (connector, description) in &pinned {
             writeln!(
                 &mut profile_buf,
-                "{PINNED_OUTPUT} \"{connector}\" is \"{description}\""
+                "{PINNED_OUTPUT} {} is {}",
+                kanshi::quote(connector),
+                kanshi::quote(description)
             )
             .unwrap();
         }
@@ -452,48 +457,148 @@ impl DisplayManager {
         (profile_name, profile_buf)
     }
 
-    /// The file name of the kanshi profile for the connected monitors, and
-    /// the outputs it names by connector, with the monitor saved for each.
-    fn kanshi_profile_name(&self) -> (String, Vec<(String, String)>) {
-        let mut names = Vec::new();
-        let mut pinned = Vec::new();
-        for monitor in &self.monitors {
-            let name = monitor.kanshi_name(&self.monitors);
-            let description = monitor.get_dpy_name();
-            if name == description {
-                names.push(description);
-            } else {
-                names.push(format!("{name}={description}"));
-                pinned.push((name, description));
-            }
-        }
-        names.sort();
-        pinned.sort();
-        let mut profile_name = names
+    /// The kanshi profile saved for `config`, as [`DisplayManager::kanshi_profile`]
+    /// writes it, after a comment that records which monitor is primary.
+    fn saved_profile(&self, config: &[MonitorApply]) -> (String, Vec<u8>) {
+        let (profile_name, mut profile_buf) = self.kanshi_profile(config);
+        let primary = config
             .iter()
-            .map(|name| name.replace(' ', "_"))
-            .collect::<Vec<String>>()
-            .join("__");
-        if !pinned.is_empty() {
-            profile_name.insert_str(0, "zz-");
+            .find(|logical| logical.is_primary())
+            .and_then(|logical| logical.search_monitor(&self.monitors));
+        if let Some(monitor) = primary {
+            let line = format!(
+                "{PRIMARY_OUTPUT} {}\n",
+                kanshi::quote(&monitor.kanshi_name(&self.monitors))
+            );
+            profile_buf.splice(0..0, line.into_bytes());
         }
-        (profile_name, pinned)
+        (profile_name, profile_buf)
+    }
+
+    /// The file name of the kanshi profile for the connected monitors (see
+    /// [`kanshi::profile_file_name`]), and the outputs it names by connector,
+    /// with the monitor saved for each.
+    fn kanshi_profile_name(&self) -> (String, Vec<(String, String)>) {
+        let outputs: Vec<NamedOutput> = self
+            .monitors
+            .iter()
+            .map(|monitor| {
+                let connector = monitor
+                    .named_by_connector(&self.monitors)
+                    .then(|| monitor.connector().to_string());
+                (connector, monitor.get_dpy_name())
+            })
+            .collect();
+        let mut pinned: Vec<(String, String)> = outputs
+            .iter()
+            .filter_map(|(connector, description)| Some((connector.clone()?, description.clone())))
+            .collect();
+        pinned.sort();
+        (kanshi::profile_file_name(&outputs), pinned)
+    }
+
+    /// How earlier versions named the connected monitors in a profile: by
+    /// connector only if another monitor had the same description, else by
+    /// description, written as it is.
+    fn earlier_outputs(&self) -> Vec<NamedOutput> {
+        self.monitors
+            .iter()
+            .map(|monitor| {
+                let description = monitor.get_dpy_name();
+                let same = self
+                    .monitors
+                    .iter()
+                    .filter(|other| other.get_dpy_name() == description)
+                    .count();
+                let connector = (same > 1).then(|| monitor.connector().to_string());
+                (connector, description)
+            })
+            .collect()
+    }
+
+    /// The file name earlier versions gave the profile of the connected
+    /// monitors, if it differs from the name it has now and is a file name.
+    fn earlier_profile_name(&self) -> Option<String> {
+        let name = kanshi::earlier_profile_file_name(&self.earlier_outputs());
+        let is_file_name = !name.is_empty()
+            && name.len() <= kanshi::NAME_MAX
+            && !name.contains(['/', '\0'])
+            && name != "."
+            && name != "..";
+        (is_file_name && name != self.kanshi_profile_name().0).then_some(name)
+    }
+
+    /// Whether `profile` is a profile that earlier versions saved for exactly
+    /// the connected monitors, in any arrangement: the comment that records
+    /// the primary monitor, if any, the comment for each monitor named by its
+    /// connector, sorted, then "profile {", a line for each monitor, in any
+    /// order, and "}". They wrote each name as it is, a quote or a newline
+    /// included, so the lines are told apart by comparing them with the names
+    /// of the connected monitors.
+    fn is_earlier_profile(&self, profile: &str) -> bool {
+        let outputs = self.earlier_outputs();
+        let names: Vec<&str> = outputs
+            .iter()
+            .map(|(connector, description)| connector.as_deref().unwrap_or(description))
+            .collect();
+        let mut pinned: Vec<(&str, &str)> = outputs
+            .iter()
+            .filter_map(|(connector, description)| {
+                Some((connector.as_deref()?, description.as_str()))
+            })
+            .collect();
+        pinned.sort();
+        let notes: String = pinned
+            .iter()
+            .map(|(connector, description)| {
+                format!("{PINNED_OUTPUT} \"{connector}\" is \"{description}\"\n")
+            })
+            .collect();
+        let primaries = names
+            .iter()
+            .map(|name| format!("{PRIMARY_OUTPUT} \"{name}\"\n"));
+        std::iter::once(String::new())
+            .chain(primaries)
+            .any(|primary| {
+                profile
+                    .strip_prefix(primary.as_str())
+                    .and_then(|rest| rest.strip_prefix(notes.as_str()))
+                    .and_then(|rest| rest.strip_prefix("profile {\n"))
+                    .is_some_and(|lines| {
+                        names_each_once(lines, &names, &mut vec![false; names.len()])
+                    })
+            })
     }
 
     /// The primary monitor saved with the profile of the connected monitors,
-    /// by connector.
+    /// by connector. Until that profile is saved again, it may be the profile
+    /// that earlier versions saved for them under another file name.
     fn saved_primary(&self, paths: &KanshiPaths) -> Option<String> {
         let (profile_name, _) = self.kanshi_profile_name();
-        let profile = fs::read_to_string(paths.profiles.join(profile_name)).ok()?;
+        let profile = fs::read_to_string(paths.profiles.join(profile_name))
+            .ok()
+            .or_else(|| {
+                let earlier = paths.profiles.join(self.earlier_profile_name()?);
+                fs::read_to_string(earlier)
+                    .ok()
+                    .filter(|profile| self.is_earlier_profile(profile))
+            })?;
         let name = profile.lines().find_map(|line| {
             let rest = line.trim().strip_prefix(PRIMARY_OUTPUT)?.trim();
-            rest.strip_prefix('"')?
-                .strip_suffix('"')
-                .map(str::to_string)
+            match kanshi::unquote(rest) {
+                Some((name, "")) => Some(name),
+                // As earlier versions wrote it, unescaped.
+                _ => rest
+                    .strip_prefix('"')?
+                    .strip_suffix('"')
+                    .map(str::to_string),
+            }
         })?;
+        // By connector or by description, as this version or an earlier one
+        // named it: a description holds spaces, a connector name none.
         self.monitors
             .iter()
-            .find(|monitor| monitor.kanshi_name(&self.monitors) == name)
+            .find(|monitor| monitor.connector() == name || monitor.get_dpy_name() == name)
             .map(|monitor| monitor.connector().to_string())
     }
 
@@ -707,68 +812,107 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
     Ok(KanshiPaths { profiles, config })
 }
 
-/// The output that a profile in this kanshi configuration names twice, if any.
-///
-/// kanshi 1.7 and later reject the whole configuration when a profile names
-/// the same output twice ("duplicate output"), so no profile applies at all.
-/// This daemon wrote such profiles for identical monitors before it told them
-/// apart by connector name.
-fn duplicate_output(config: &str) -> Option<String> {
-    let mut seen = HashSet::new();
-    for line in config.lines() {
-        let line = line.trim();
-        // The start or the end of a profile.
-        if line.starts_with("profile") || line.starts_with('}') {
-            seen.clear();
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("output") else {
-            continue;
-        };
-        if !rest.starts_with(char::is_whitespace) {
-            continue;
-        }
-        let rest = rest.trim_start();
-        let name = match rest.chars().next() {
-            Some(quote @ ('"' | '\'')) => rest[1..].split(quote).next().unwrap_or_default(),
-            _ => rest.split_whitespace().next().unwrap_or_default(),
-        };
-        if !seen.insert(name) {
-            return Some(name.to_string());
-        }
+/// Move the profiles that kanshi refuses to load out of the profiles
+/// directory, which the kanshi configuration includes as a whole, to
+/// "invalid-profiles" next to it, with their contents. One such file keeps
+/// kanshi from applying any profile. The installed kanshi tells (see
+/// [`kanshi::loads`]); it runs on a thread that may block.
+async fn set_aside_invalid_profiles(paths: &KanshiPaths) {
+    let paths = paths.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        set_aside_profiles_kanshi_refuses(&paths, OsStr::new("kanshi"))
+    })
+    .await;
+    if let Err(e) = checked {
+        error!("Cannot check the kanshi profiles: {e}");
     }
-    None
 }
 
-/// Move the profiles that kanshi would reject out of the profiles directory,
-/// which the kanshi configuration includes as a whole, to "invalid-profiles"
-/// next to it. One such file keeps kanshi from applying any profile.
-fn set_aside_invalid_profiles(paths: &KanshiPaths) {
-    let Ok(entries) = fs::read_dir(&paths.profiles) else {
+/// [`set_aside_invalid_profiles`], asking the `kanshi` executable.
+///
+/// Only if kanshi refuses the whole configuration, and can tell (see
+/// [`kanshi::can_tell`]): then each entry that kanshi refuses on its own
+/// moves, a directory included. A file may still use an output alias that
+/// another file or the configuration itself defines, so each one that moved
+/// comes back if kanshi loads the configuration with it. If kanshi refuses
+/// the configuration for another reason, even without them, they all come
+/// back: moving them would not help.
+fn set_aside_profiles_kanshi_refuses(paths: &KanshiPaths, kanshi: &OsStr) {
+    if kanshi::loads(kanshi, &paths.config) != Some(false) || !kanshi::can_tell(kanshi) {
         return;
-    };
+    }
     let aside = paths.profiles.with_file_name("invalid-profiles");
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(profile) = fs::read_to_string(&path) else {
+    let mut files: Vec<PathBuf> = fs::read_dir(&paths.profiles)
+        .into_iter()
+        .flatten()
+        .flatten()
+        // The include glob skips hidden files.
+        .filter(|entry| !entry.file_name().as_bytes().starts_with(b"."))
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    let mut moved = Vec::new();
+    for path in files {
+        if kanshi::loads(kanshi, &path) != Some(false) {
+            continue;
+        }
+        let Some(target) = path.file_name().map(|name| free_path(&aside, name)) else {
             continue;
         };
-        let Some(output) = duplicate_output(&profile) else {
-            continue;
-        };
-        let target = aside.join(entry.file_name());
         match fs::create_dir_all(&aside).and_then(|_| fs::rename(&path, &target)) {
-            Ok(()) => warn!(
-                "kanshi profile {} names output \"{output}\" twice, which kanshi rejects: moved it to {}",
-                path.display(),
-                target.display()
-            ),
-            Err(e) => error!(
-                "kanshi profile {} names output \"{output}\" twice, which kanshi rejects, and could not be moved: {e}",
-                path.display()
-            ),
+            Ok(()) => moved.push((path, target)),
+            Err(e) => {
+                error!("kanshi refuses to load profile {path:?}, and it could not be moved: {e}")
+            }
         }
     }
+    if moved.is_empty() {
+        return;
+    }
+    let loads = kanshi::loads(kanshi, &paths.config) == Some(true);
+    if !loads {
+        error!(
+            "kanshi refuses to load {:?} even without the profiles it refuses on their own: left them where they were",
+            paths.config
+        );
+    }
+    moved.retain(|(path, target)| {
+        if fs::rename(target, path).is_err() {
+            return true;
+        }
+        if !loads {
+            return false;
+        }
+        if kanshi::loads(kanshi, &paths.config) == Some(true) {
+            info!("kanshi loads profile {path:?} with the other profiles: kept it");
+            return false;
+        }
+        // Aside again: it keeps kanshi from loading the rest.
+        match fs::rename(path, target) {
+            Ok(()) => true,
+            Err(e) => {
+                error!("kanshi refuses to load profile {path:?}, and it could not be moved: {e}");
+                false
+            }
+        }
+    });
+    for (path, target) in moved {
+        warn!("kanshi refuses to load profile {path:?}: moved it to {target:?}");
+    }
+}
+
+/// `dir`/`name`, or with ".1", ".2"... after the name if that is taken, so
+/// that a file set aside earlier stays.
+fn free_path(dir: &Path, name: &OsStr) -> PathBuf {
+    let mut path = dir.join(name);
+    let mut n = 0;
+    while path.symlink_metadata().is_ok() {
+        n += 1;
+        let mut numbered = name.to_os_string();
+        numbered.push(format!(".{n}"));
+        path = dir.join(numbered);
+    }
+    path
 }
 
 /// The comment that records, in a kanshi profile, which monitor an output
@@ -862,12 +1006,75 @@ fn pinned_outputs(profile: &str) -> Vec<(String, String)> {
         .lines()
         .filter_map(|line| {
             let rest = line.strip_prefix(PINNED_OUTPUT)?.trim();
+            let quoted = kanshi::unquote(rest).and_then(|(connector, rest)| {
+                let (description, rest) = kanshi::unquote(rest.strip_prefix(" is ")?)?;
+                rest.is_empty().then_some((connector, description))
+            });
+            if quoted.is_some() {
+                return quoted;
+            }
+            // As earlier versions wrote it, unescaped.
             let (connector, description) = rest.split_once("\" is \"")?;
             let connector = connector.strip_prefix('"')?;
             let description = description.strip_suffix('"')?;
             Some((connector.to_string(), description.to_string()))
         })
         .collect()
+}
+
+/// Whether `lines`, the lines of a profile after "profile {" as earlier
+/// versions wrote them, name each of `names` once, in any order, and then
+/// end with "}". `read` tells which names have been read so far.
+fn names_each_once(lines: &str, names: &[&str], read: &mut [bool]) -> bool {
+    if read.iter().all(|read| *read) {
+        return lines == "}\n";
+    }
+    (0..names.len()).any(|i| {
+        if read[i] {
+            return false;
+        }
+        // The settings after the name hold no newline.
+        let Some((_, rest)) = lines
+            .strip_prefix("\toutput \"")
+            .and_then(|rest| rest.strip_prefix(names[i]))
+            .and_then(|rest| rest.strip_prefix("\" "))
+            .and_then(|rest| rest.split_once('\n'))
+        else {
+            return false;
+        };
+        read[i] = true;
+        let named = names_each_once(rest, names, read);
+        read[i] = false;
+        named
+    })
+}
+
+/// Remove the profile that earlier versions saved for the connected
+/// monitors under another file name than `profile_name`, which now holds
+/// their profile: kanshi would go on loading both, and may apply the old one.
+/// Only if it is such a profile (see [`DisplayManager::is_earlier_profile`]):
+/// a file for other monitors may have the same name, and stays.
+fn remove_superseded_profile(paths: &KanshiPaths, manager: &DisplayManager, profile_name: &str) {
+    if manager.kanshi_profile_name().0 != profile_name {
+        // Saved for monitors that are no longer the connected ones.
+        return;
+    }
+    let Some(earlier) = manager.earlier_profile_name() else {
+        return;
+    };
+    let path = paths.profiles.join(earlier);
+    let Ok(profile) = fs::read_to_string(&path) else {
+        return;
+    };
+    if !manager.is_earlier_profile(&profile) {
+        return;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => info!(
+            "Removed kanshi profile {path:?}: the profile of these monitors is {profile_name:?} now"
+        ),
+        Err(e) => error!("Cannot remove kanshi profile {path:?}: {e}"),
+    }
 }
 
 /// The description of the monitor on each connector.
@@ -1201,14 +1408,17 @@ mod tests {
         .unwrap()
     }
 
-    fn profile(monitors: Vec<Monitor>, config: &[MonitorApply]) -> (String, String) {
-        let manager = DisplayManager {
+    fn manager_for(monitors: Vec<Monitor>) -> DisplayManager {
+        DisplayManager {
             serial: 0,
             monitors,
             logical_monitors: Vec::new(),
             properties: DisplayManagerProperties::new(),
-        };
-        let (name, contents) = manager.kanshi_profile(config);
+        }
+    }
+
+    fn profile(monitors: Vec<Monitor>, config: &[MonitorApply]) -> (String, String) {
+        let (name, contents) = manager_for(monitors).kanshi_profile(config);
         (name, String::from_utf8(contents).unwrap())
     }
 
@@ -1236,7 +1446,6 @@ mod tests {
              \toutput \"DP-2\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
              }\n"
         );
-        assert_eq!(duplicate_output(&contents), None);
     }
 
     #[test]
@@ -1283,6 +1492,245 @@ mod tests {
         );
     }
 
+    /// Monitors whose descriptions kanshi cannot read back as they are: a
+    /// newline that would end the profile and start another, double quotes,
+    /// a tab, pattern characters, a backslash and a leading "$"; and one with
+    /// slashes, which kanshi reads as they are.
+    fn unusual_monitors() -> Vec<Monitor> {
+        vec![
+            monitor(
+                "DP-1",
+                "Acme\"\n}\nprofile {\n\toutput \"*\" disable",
+                "M1",
+                "S1",
+            ),
+            monitor("DP-2", "$work", "View[24]", "S*1 \\"),
+            monitor("DP-3", "../Acme", "M/1", "S1"),
+            monitor("HDMI-A-1", "Acme \"Pro\"", "M\t1", "S1"),
+        ]
+    }
+
+    #[test]
+    fn unusual_descriptions_cannot_add_to_the_profile() {
+        let monitors = unusual_monitors();
+        let (_, contents) = profile(
+            monitors.clone(),
+            &[place("DP-1", 0), place("DP-2", 1920), place("DP-3", 3840)],
+        );
+        assert_eq!(
+            contents,
+            "# regolith-displayd: output \"DP-1\" is \"Acme\\\"\\u{a}}\\u{a}profile {\\u{a}\\u{9}output \\\"*\\\" disable M1 S1\"\n\
+             # regolith-displayd: output \"DP-2\" is \"$work View[24] S*1 \\\\\"\n\
+             # regolith-displayd: output \"HDMI-A-1\" is \"Acme \\\"Pro\\\" M\\u{9}1 S1\"\n\
+             profile {\n\
+             \toutput \"DP-1\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+             \toutput \"DP-2\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
+             \toutput \"../Acme M/1 S1\" mode 1920x1080@60Hz position 3840,0 transform normal scale 1 enable\n\
+             \toutput \"HDMI-A-1\" disable\n\
+             }\n"
+        );
+        assert_eq!(
+            pinned_outputs(&contents),
+            [
+                ("DP-1".to_string(), monitors[0].get_dpy_name()),
+                ("DP-2".to_string(), monitors[1].get_dpy_name()),
+                ("HDMI-A-1".to_string(), monitors[3].get_dpy_name())
+            ]
+        );
+        // As earlier versions wrote it.
+        assert_eq!(
+            pinned_outputs("# regolith-displayd: output \"DP-1\" is \"Acme \\ M1 S1\"\n"),
+            [("DP-1".to_string(), "Acme \\ M1 S1".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_primary_monitor_is_read_back_whatever_its_description() {
+        let dir =
+            std::env::temp_dir().join(format!("displayd-primary-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = KanshiPaths {
+            profiles: dir.join("profiles"),
+            config: dir.join("config"),
+        };
+        fs::create_dir_all(&paths.profiles).unwrap();
+        let manager = manager_for(vec![
+            monitor("DP-1", "Acme \"Pro\"", "M\n1", "S1"),
+            monitor("DP-2", "Écran", "{1} #2 'x' ]", "S1"),
+        ]);
+        for primary in ["DP-1", "DP-2"] {
+            let config = [
+                arrange("DP-1", 0, primary == "DP-1"),
+                arrange("DP-2", 1920, primary == "DP-2"),
+            ];
+            let (name, contents) = manager.saved_profile(&config);
+            fs::write(paths.profiles.join(name), contents).unwrap();
+            assert_eq!(manager.saved_primary(&paths).as_deref(), Some(primary));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `connector` at `x`, primary or not, as the Displays panel applies it.
+    fn arrange(connector: &str, x: i32, primary: bool) -> MonitorApply {
+        serde_json::from_value(serde_json::json!({
+            "x_pos": x, "y_pos": 0, "scale": 1.0, "transform": 0, "primary": primary,
+            "monitors": [[connector, "1920x1080@60Hz", {}]]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn kanshi_reads_profiles_for_unusual_monitors() {
+        let kanshi = Path::new("/usr/bin/kanshi");
+        if !kanshi.exists() {
+            eprintln!("skipping, kanshi is not installed");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("displayd-kanshi-unusual-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let profiles = dir.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        let config = dir.join("config");
+        fs::write(&config, format!("include {}/*\n", profiles.display())).unwrap();
+        let mut long = unusual_monitors();
+        long.push(monitor("DP-4", "Acme", &"L".repeat(300), "S1"));
+        for monitors in [unusual_monitors(), long] {
+            let (name, contents) = profile(
+                monitors,
+                &[place("DP-1", 0), place("DP-2", 1920), place("DP-3", 3840)],
+            );
+            let path = profiles.join(&name);
+            assert_eq!(path.parent(), Some(profiles.as_path()), "{name}");
+            fs::write(path, contents).unwrap();
+        }
+        assert_eq!(file_names(&profiles).len(), 2);
+        let stderr = kanshi_parse(kanshi, &dir, &config);
+        assert!(
+            stderr.contains("failed to connect to display"),
+            "kanshi rejected the profiles: {stderr}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_saved_under_earlier_names_are_removed() {
+        let dir =
+            std::env::temp_dir().join(format!("displayd-superseded-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = KanshiPaths {
+            profiles: dir.join("profiles"),
+            config: dir.join("config"),
+        };
+        fs::create_dir_all(&paths.profiles).unwrap();
+        let manager = manager_for(vec![
+            monitor("DP-1", "Acme", "LG_Ultra", "S1"),
+            monitor("DP-2", "Plain", "M2", "S2"),
+        ]);
+        let (name, _) = manager.kanshi_profile_name();
+        assert_eq!(name, "Acme_LG%5FUltra_S1__Plain_M2_S2");
+        let earlier = manager.earlier_profile_name().unwrap();
+        assert_eq!(earlier, "Acme_LG_Ultra_S1__Plain_M2_S2");
+        let saved = |file: &str, contents: &str| {
+            fs::write(paths.profiles.join(file), contents).unwrap();
+        };
+        let old = "# regolith-displayd: primary \"Plain M2 S2\"\n\
+                   profile {\n\
+                   \toutput \"Plain M2 S2\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+                   \toutput \"Acme LG_Ultra S1\" disable\n\
+                   }\n";
+        let (_, contents) = manager.saved_profile(&[arrange("DP-1", 0, true)]);
+        let contents = String::from_utf8(contents).unwrap();
+
+        // Under the earlier name, files for other monitors stay: one of these
+        // monitors, one more, another profile too, or a connector comment
+        // that these monitors do not need.
+        for other in [
+            "profile {\n\toutput \"Acme LG Ultra S1\" enable\n\toutput \"Plain M2 S2\" enable\n}\n"
+                .to_string(),
+            "profile {\n\toutput \"Acme LG_Ultra S1\" enable\n}\n".to_string(),
+            old.replace("}\n", "\toutput \"Plain M3 S3\" disable\n}\n"),
+            format!("{old}profile {{\n\toutput \"Plain M2 S2\" enable\n}}\n"),
+            format!("# regolith-displayd: output \"DP-1\" is \"Acme LG_Ultra S1\"\n{old}"),
+        ] {
+            saved(&earlier, &other);
+            saved(&name, &contents);
+            remove_superseded_profile(&paths, &manager, &name);
+            assert_eq!(
+                fs::read_to_string(paths.profiles.join(&earlier)).unwrap(),
+                other
+            );
+        }
+        // Until the monitors are saved again, the earlier profile has their
+        // primary monitor; then it goes.
+        fs::remove_file(paths.profiles.join(&name)).unwrap();
+        saved(&earlier, old);
+        assert_eq!(manager.saved_primary(&paths).as_deref(), Some("DP-2"));
+        saved(&name, &contents);
+        assert_eq!(manager.saved_primary(&paths).as_deref(), Some("DP-1"));
+        remove_superseded_profile(&paths, &manager, &name);
+        assert_eq!(file_names(&paths.profiles), [name.as_str()]);
+        // Not when the profile was saved for other monitors.
+        saved(&earlier, old);
+        remove_superseded_profile(&paths, &manager, "another-set");
+        assert_eq!(file_names(&paths.profiles).len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn earlier_profiles_with_unusual_names_are_recognised() {
+        // A newline: kanshi before 1.6 read such a profile, and an earlier
+        // name differs from the name now.
+        let manager = manager_for(vec![monitor("DP-1", "Acme", "M\n1", "S1")]);
+        let earlier = "profile {\n\
+                       \toutput \"Acme M\n1 S1\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n\
+                       }\n";
+        assert!(manager.is_earlier_profile(earlier));
+        assert_eq!(
+            manager.earlier_profile_name().as_deref(),
+            Some("Acme_M\n1_S1")
+        );
+        assert_eq!(manager.kanshi_profile_name().0, "zz-DP-1=Acme_M%0A1_S1");
+
+        // Identical monitors: only with the monitor recorded on each connector.
+        let identical = manager_for(vec![
+            monitor("DP-1", "Same", "M_1", "S1"),
+            monitor("DP-2", "Same", "M_1", "S1"),
+        ]);
+        let profile = "profile {\n\toutput \"DP-2\" disable\n\toutput \"DP-1\" enable\n}\n";
+        let one = "# regolith-displayd: output \"DP-1\" is \"Same M_1 S1\"\n";
+        let two = "# regolith-displayd: output \"DP-2\" is \"Same M_1 S1\"\n";
+        let elsewhere = "# regolith-displayd: output \"DP-2\" is \"Other M_1 S1\"\n";
+        assert!(identical.is_earlier_profile(&format!("{one}{two}{profile}")));
+        assert!(identical.is_earlier_profile(&format!(
+            "# regolith-displayd: primary \"DP-1\"\n{one}{two}{profile}"
+        )));
+        for other in [
+            profile.to_string(),
+            format!("{one}{profile}"),
+            format!("{two}{one}{profile}"),
+            format!("{one}{elsewhere}{profile}"),
+            format!("{one}{two}{elsewhere}{profile}"),
+            format!("{one}{two}{profile}{profile}"),
+        ] {
+            assert!(!identical.is_earlier_profile(&other), "{other}");
+        }
+
+        // A name that holds the start of another line: the lines can be read
+        // in more than one way, and one of them names each monitor once.
+        let tricky = manager_for(vec![
+            monitor("DP-1", "X", "Y", "Z"),
+            monitor("DP-2", "X", "Y", "Z\" disable\n\toutput \"X Y Z"),
+        ]);
+        let lines = "profile {\n\
+                     \toutput \"X Y Z\" disable\n\
+                     \toutput \"X Y Z\" disable\n\
+                     \toutput \"X Y Z\" disable\n\
+                     }\n";
+        assert!(tricky.is_earlier_profile(lines));
+        assert!(!tricky.is_earlier_profile(&lines.replacen("\toutput \"X Y Z\" disable\n", "", 1)));
+    }
+
     /// A profile for two identical monitors as written before they were told
     /// apart: kanshi 1.7 and later reject it, and with it every profile.
     const OLD_IDENTICAL_PROFILE: &str = "profile {\n\
@@ -1290,62 +1738,204 @@ mod tests {
         \toutput \"Acme View 24 0\" mode 1920x1080@60Hz position 1920,0 transform normal scale 1 enable\n\
         }\n";
 
-    #[test]
-    fn duplicate_outputs_are_found_per_profile() {
-        assert_eq!(
-            duplicate_output(OLD_IDENTICAL_PROFILE).as_deref(),
-            Some("Acme View 24 0")
-        );
-        assert_eq!(
-            duplicate_output("profile {\n  output DP-1 enable\n  output DP-1 disable\n}\n")
-                .as_deref(),
-            Some("DP-1")
-        );
-        // The same output in two profiles, and the dummy profile.
-        let two_profiles = "profile a {\n\toutput \"Acme View 24 0\" enable\n}\n\
-                            profile b {\n\toutput \"Acme View 24 0\" disable\n}\n";
-        assert_eq!(duplicate_output(two_profiles), None);
-        assert_eq!(duplicate_output("profile {}\n"), None);
-    }
+    /// A kanshi that only reads its configuration, and the directory that it
+    /// includes: it refuses it if it holds "BROKEN", or "uses $alias" without
+    /// "defines $alias". It says it is connected to a compositor unless it
+    /// is run where it cannot connect.
+    const FAKE_KANSHI: &str = r#"#!/bin/sh
+[ "$1" = -c ] || exit 2
+if [ -n "$WAYLAND_SOCKET" ] || [ "$WAYLAND_DISPLAY" != /dev/null/regolith-displayd-config-check ]; then
+    echo "connected" >&2
+    exit 1
+fi
+dir=$(sed -n 's|^include \(.*\)/\*$|\1|p' "$2")
+text=$(cat "$2" && if [ -n "$dir" ]; then for f in "$dir"/*; do cat "$f" || exit 1; done; fi) || exit 1
+case $text in *BROKEN*) echo "broken" >&2; exit 1 ;; esac
+case $text in *'uses $alias'*)
+    case $text in *'defines $alias'*) ;; *) echo "undefined alias" >&2; exit 1 ;; esac ;;
+esac
+echo "failed to connect to display" >&2
+exit 1
+"#;
 
-    #[test]
-    fn profiles_kanshi_rejects_are_set_aside() {
-        let dir =
-            std::env::temp_dir().join(format!("displayd-profiles-test-{}", std::process::id()));
+    /// Profiles and a configuration that includes them, in a new directory
+    /// named after `test`, with [`FAKE_KANSHI`] there; and the directory.
+    fn fake_kanshi_profiles(
+        test: &str,
+        config: &str,
+        profiles: &[(&str, &str)],
+    ) -> (KanshiPaths, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("displayd-{test}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let paths = KanshiPaths {
             profiles: dir.join("profiles"),
             config: dir.join("config"),
         };
         fs::create_dir_all(&paths.profiles).unwrap();
-        let (name, contents) = profile(
-            vec![acme("DP-1"), acme("DP-2")],
-            &[place("DP-1", 0), place("DP-2", 1920)],
+        write_script(&dir.join("fake-kanshi"), FAKE_KANSHI);
+        let include = format!("include {}/*\n", paths.profiles.display());
+        fs::write(&paths.config, format!("{config}{include}")).unwrap();
+        for (name, contents) in profiles {
+            fs::write(paths.profiles.join(name), contents).unwrap();
+        }
+        (paths, dir)
+    }
+
+    #[test]
+    fn profiles_kanshi_refuses_are_set_aside() {
+        let refused = [("a-broken", "BROKEN\n"), ("d-broken", "profile BROKEN\n")];
+        let kept = [
+            (".hidden", "BROKEN\n"),
+            ("b-dummy", "profile {}\n"),
+            // Refused on its own, loaded with the configuration.
+            ("c-uses-alias", "uses $alias\n"),
+        ];
+        let all: Vec<(&str, &str)> = refused.iter().chain(&kept).copied().collect();
+        let (paths, dir) = fake_kanshi_profiles("set-aside", "defines $alias\n", &all);
+        let kanshi = dir.join("fake-kanshi");
+        let kept_names: Vec<&str> = kept.iter().map(|(name, _)| *name).collect();
+        let aside = dir.join("invalid-profiles");
+        // Set aside earlier, under the same name: it stays.
+        fs::create_dir_all(&aside).unwrap();
+        fs::write(aside.join("a-broken"), "older\n").unwrap();
+
+        // kanshi cannot be run: nothing can be told.
+        set_aside_profiles_kanshi_refuses(&paths, dir.join("missing").as_os_str());
+        assert_eq!(file_names(&paths.profiles).len(), 5);
+
+        for _ in 0..2 {
+            set_aside_profiles_kanshi_refuses(&paths, kanshi.as_os_str());
+            assert_eq!(file_names(&paths.profiles), kept_names);
+            assert_eq!(file_names(&aside), ["a-broken", "a-broken.1", "d-broken"]);
+            assert_eq!(
+                fs::read_to_string(aside.join("a-broken")).unwrap(),
+                "older\n"
+            );
+            assert_eq!(
+                fs::read_to_string(aside.join("a-broken.1")).unwrap(),
+                "BROKEN\n"
+            );
+            assert_eq!(
+                fs::read_to_string(aside.join("d-broken")).unwrap(),
+                "profile BROKEN\n"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_stay_when_moving_them_cannot_help() {
+        let profiles = [("a-broken", "BROKEN\n"), ("b-dummy", "profile {}\n")];
+        // The configuration itself is refused, with or without the profiles.
+        let (paths, dir) = fake_kanshi_profiles("broken-config", "BROKEN\n", &profiles);
+        set_aside_profiles_kanshi_refuses(&paths, dir.join("fake-kanshi").as_os_str());
+        assert_eq!(file_names(&paths.profiles), ["a-broken", "b-dummy"]);
+        assert!(file_names(&dir.join("invalid-profiles")).is_empty());
+
+        // A kanshi that refuses everything, as kanshi 1.1 does when it has no
+        // configuration of its own, whatever it is given.
+        let refusing = dir.join("refusing-kanshi");
+        write_script(
+            &refusing,
+            "#!/bin/sh\necho \"no configuration\" >&2\nexit 1\n",
         );
-        fs::write(paths.profiles.join(name), contents).unwrap();
         fs::write(
-            paths.profiles.join("Acme_View_24_0__Acme_View_24_0"),
-            OLD_IDENTICAL_PROFILE,
+            &paths.config,
+            format!("include {}/*\n", paths.profiles.display()),
         )
         .unwrap();
-        fs::write(paths.profiles.join("dummy"), "profile {}\n").unwrap();
+        set_aside_profiles_kanshi_refuses(&paths, refusing.as_os_str());
+        assert_eq!(file_names(&paths.profiles), ["a-broken", "b-dummy"]);
+        assert!(file_names(&dir.join("invalid-profiles")).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        set_aside_invalid_profiles(&paths);
+    #[test]
+    fn profiles_the_installed_kanshi_refuses_are_set_aside() {
+        let installed = Path::new("/usr/bin/kanshi");
+        if !installed.exists() {
+            eprintln!("skipping, kanshi is not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("displayd-refused-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = KanshiPaths {
+            profiles: dir.join("profiles"),
+            config: dir.join("config"),
+        };
+        fs::create_dir_all(&paths.profiles).unwrap();
+        // Through a link with another name, so the reload test does not take
+        // it for a running kanshi.
+        let kanshi = dir.join("kanshi-check");
+        std::os::unix::fs::symlink(installed, &kanshi).unwrap();
+        let probe = dir.join("probe");
+        fs::write(&probe, OLD_IDENTICAL_PROFILE).unwrap();
+        if kanshi::loads(kanshi.as_os_str(), &probe) != Some(false) {
+            eprintln!("skipping, this kanshi is older than 1.7");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        fs::write(
+            &paths.config,
+            format!(
+                "output \"Q R S\" alias $configured\ninclude {}/*\n",
+                paths.profiles.display()
+            ),
+        )
+        .unwrap();
+        let old = |description: &str| {
+            format!(
+                "profile {{\n\toutput \"{description}\" mode 1920x1080@60Hz position 0,0 transform normal scale 1 enable\n}}\n"
+            )
+        };
+        // As earlier versions wrote them, for monitors with a double quote, a
+        // newline or a leading "$" in their descriptions, or two identical ones.
+        let refused = [
+            (
+                "missing-include",
+                "include /nonexistent/profile\n".to_string(),
+            ),
+            ("old-alias", old("$work M1 S1")),
+            ("old-identical", OLD_IDENTICAL_PROFILE.to_string()),
+            ("old-newline", old("Acme\n M1 S1")),
+            ("old-quote", old("Acme \"Pro\" M1 S1")),
+        ];
+        let (unusual, contents) = profile(
+            unusual_monitors(),
+            &[place("DP-1", 0), place("DP-2", 1920), place("DP-3", 3840)],
+        );
+        let kept = [
+            ("dummy".to_string(), "profile {}\n".to_string()),
+            (
+                "uses-configured-alias".to_string(),
+                "profile {\n\toutput $configured enable\n}\n".to_string(),
+            ),
+            (unusual, contents),
+        ];
+        for (name, contents) in refused
+            .iter()
+            .map(|(n, c)| (*n, c))
+            .chain(kept.iter().map(|(n, c)| (n.as_str(), c)))
+        {
+            fs::write(paths.profiles.join(name), contents).unwrap();
+        }
+        assert_eq!(
+            kanshi::loads(kanshi.as_os_str(), &paths.config),
+            Some(false)
+        );
 
-        let mut kept: Vec<String> = fs::read_dir(&paths.profiles)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        kept.sort();
-        assert_eq!(
-            kept,
-            ["dummy", "zz-DP-1=Acme_View_24_0__DP-2=Acme_View_24_0"]
-        );
-        assert_eq!(
-            fs::read_to_string(dir.join("invalid-profiles/Acme_View_24_0__Acme_View_24_0"))
-                .unwrap(),
-            OLD_IDENTICAL_PROFILE
-        );
+        set_aside_profiles_kanshi_refuses(&paths, kanshi.as_os_str());
+
+        let mut kept_names: Vec<&str> = kept.iter().map(|(name, _)| name.as_str()).collect();
+        kept_names.sort();
+        assert_eq!(file_names(&paths.profiles), kept_names);
+        let aside = dir.join("invalid-profiles");
+        let refused_names: Vec<&str> = refused.iter().map(|(name, _)| *name).collect();
+        assert_eq!(file_names(&aside), refused_names);
+        for (name, contents) in &refused {
+            assert_eq!(&fs::read_to_string(aside.join(name)).unwrap(), contents);
+        }
+        assert_eq!(kanshi::loads(kanshi.as_os_str(), &paths.config), Some(true));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2257,12 +2847,14 @@ async fn save_profile(
     profile_buf: &[u8],
 ) -> zbus::fdo::Result<()> {
     let kanshi_paths = get_kanshi_paths().await?;
+    let _profiles = KANSHI_PROFILES.lock().await;
     fs::create_dir_all(&kanshi_paths.profiles)
         .and_then(|_| fs::write(kanshi_paths.profiles.join(profile_name), profile_buf))
         .map_err(|e| zbus::fdo::Error::IOError(e.to_string()))?;
-    // An older profile for the same identical monitors names one output
-    // twice and would still keep kanshi from loading any profile.
-    set_aside_invalid_profiles(&kanshi_paths);
+    remove_superseded_profile(&kanshi_paths, manager_obj, profile_name);
+    // A profile kanshi refuses, such as one an earlier version wrote for
+    // these monitors, would still keep kanshi from loading any profile.
+    set_aside_invalid_profiles(&kanshi_paths).await;
     hold_profiles_for_other_monitors(&kanshi_paths, &connected_outputs(&manager_obj.monitors));
     if let Err(e) = reload_kanshi().await {
         error!("Error reloading kanshi configuration: {e}");

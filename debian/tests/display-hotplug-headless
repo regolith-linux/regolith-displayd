@@ -157,15 +157,19 @@ sleep 1
 # Disable and enable: the monitor stays, its logical monitor goes and comes back.
 appears "$second" 2 || fail "$second appears $(appearances "$second") times in the state, not 2"
 before=$(signals)
+old_serial=$(serial)
 swaymsg -q output "$second" disable || true
 if retry 10 sway_active_is "$second" False; then
     retry 20 appears "$second" 1 || fail "regolith-displayd still reports $second as enabled after it was disabled"
     retry 20 signals_above "$before" || fail "no MonitorsChanged after disabling $second"
+    [ "$(serial)" != "$old_serial" ] || fail "the serial is still $old_serial after $second was disabled"
     before=$(signals)
+    old_serial=$(serial)
     swaymsg -q output "$second" enable
     retry 20 appears "$second" 2 || fail "regolith-displayd does not report $second as enabled again"
     retry 20 signals_above "$before" || fail "no MonitorsChanged after enabling $second"
-    echo "ok: regolith-displayd noticed that $second was disabled and enabled again"
+    [ "$(serial)" != "$old_serial" ] || fail "the serial is still $old_serial after $second was enabled"
+    echo "ok: regolith-displayd noticed that $second was disabled and enabled again, and moved the serial on each time"
 else
     # sway 1.7 (Ubuntu 22.04) cannot disable a headless output.
     echo "note: sway cannot disable a headless output here, disable checks skipped"

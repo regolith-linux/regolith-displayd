@@ -12,7 +12,6 @@ use log::{debug, error, info, warn};
 use monitor::{LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::hash::Hash;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::process::{Command, Stdio};
@@ -92,6 +91,9 @@ pub struct DisplayServer {
     /// The primary monitor chosen by the last Apply (see [`PrimaryChoice`]).
     /// A persistent change that is reverted brings the previous one back.
     primary: Arc<Mutex<Option<PrimaryChoice>>>,
+    /// The state the last `GetCurrentState` reported, which the next one is
+    /// compared with to move the serial on (see [`DisplayManager::report`]).
+    last_reported: Option<DisplayManager>,
 }
 
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
@@ -121,18 +123,19 @@ pub struct KanshiPaths {
 impl DisplayServer {
     pub async fn get_current_state(&mut self) -> DisplayManager {
         info!("Recieved 'GetCurrentState' request from control-center");
-        let mut state = self.manager.lock().await.clone();
+        let mut manager = self.manager.lock().await;
         let remembered = self.primary.lock().await.clone();
         let chosen = match &remembered {
-            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
+            Some((set, connector)) if *set == monitor_set(&manager.monitors) => {
                 Some(connector.clone())
             }
             _ => match get_kanshi_paths().await {
-                Ok(paths) => state.saved_primary(&paths),
+                Ok(paths) => manager.saved_primary(&paths),
                 Err(_) => None,
             },
         };
-        state.mark_primary(chosen.as_deref());
+        let state = manager.report(chosen.as_deref(), self.last_reported.as_ref());
+        self.last_reported = Some(state.clone());
         state
     }
 
@@ -154,12 +157,19 @@ impl DisplayServer {
         let called = Instant::now();
         debug!("Configuration Method: {method}");
         let mut manager_obj = self.manager.lock().await;
-        // Monitors plugged in or unplugged since the watcher last looked:
-        // the configuration was made for other monitors, so refuse it rather
-        // than save it as their profile. The watcher reports the change,
-        // moving the serial on, and the panel reads the new state.
+        // Monitors plugged in or unplugged since the watcher last looked, or
+        // since GetCurrentState last reported them: the configuration was
+        // made for other monitors, so refuse it rather than save it as their
+        // profile. The watcher tells the panel, which reads the new state
+        // and, with it, a new serial.
         match manager_obj.get_monitor_info(&self.sway_connection).await {
-            Ok((monitors, _)) if !same_monitors(&manager_obj.monitors, &monitors) => {
+            Ok((monitors, _))
+                if !same_monitors(&manager_obj.monitors, &monitors)
+                    || self
+                        .last_reported
+                        .as_ref()
+                        .is_some_and(|state| !same_monitors(&state.monitors, &monitors)) =>
+            {
                 error!("Invalid configuration recieved for method apply_monitors_config: the monitors changed");
                 return Err(zbus::fdo::Error::InvalidArgs(String::from(
                     "The monitors changed",
@@ -320,6 +330,7 @@ impl DisplayServer {
             manager,
             sway_connection,
             primary: Arc::new(Mutex::new(None)),
+            last_reported: None,
         }
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
@@ -603,33 +614,69 @@ impl DisplayManager {
     }
 
     /// Store `monitors` and `logical_monitors` if they differ from the current
-    /// state, as sets: a monitor that was added, removed or changed mode, or a
-    /// logical monitor that was added, removed, moved, scaled or rotated, or
-    /// that now shows another monitor. Returns whether they did.
+    /// state, in any order: a monitor that was added or removed, or whose
+    /// modes or properties changed, or a logical monitor that was added,
+    /// removed, moved, scaled or rotated, or that now shows another monitor.
+    /// Sway's primary flag alone is no change (see
+    /// [`LogicalMonitor::same_layout`]). Returns whether they did.
     ///
-    /// When monitors were plugged in or unplugged, the serial also moves on,
-    /// so a configuration composed for the previous monitors is refused
-    /// instead of being saved as their profile. (Mutter moves it on every
-    /// change; a new layout or mode keeps it here, so a client may still
-    /// apply several layouts in a row with one serial.)
+    /// The serial is left alone: it moves on when the change is reported
+    /// (see [`DisplayManager::report`]).
     fn update(&mut self, monitors: Vec<Monitor>, logical_monitors: Vec<LogicalMonitor>) -> bool {
-        if same_set(&self.monitors, &monitors)
-            && same_set(&self.logical_monitors, &logical_monitors)
+        if same_elements(&self.monitors, &monitors, Monitor::reports_same)
+            && same_elements(
+                &self.logical_monitors,
+                &logical_monitors,
+                LogicalMonitor::same_layout,
+            )
         {
             return false;
-        }
-        if !same_monitors(&self.monitors, &monitors) {
-            self.serial = self.serial.wrapping_add(1);
         }
         self.monitors = monitors;
         self.logical_monitors = logical_monitors;
         true
     }
+
+    /// The state for `GetCurrentState` to report, with exactly one primary
+    /// marked (see [`DisplayManager::mark_primary`]), and the serial.
+    ///
+    /// The serial moves on whenever the state differs from `last`, the
+    /// state reported before, as in Mutter: after any Apply or outside
+    /// change that shows in the report, the primary alone included. So a
+    /// configuration composed for an older state is refused. The new serial
+    /// comes with the first report of the new state; until then, the serial
+    /// last reported stays valid, and only that one. A change nothing
+    /// reports, such as sway's own primary flag, keeps the serial.
+    fn report(&mut self, chosen: Option<&str>, last: Option<&DisplayManager>) -> DisplayManager {
+        let mut state = self.clone();
+        state.mark_primary(chosen);
+        if last.is_some_and(|last| !last.reports_same(&state)) {
+            self.serial = self.serial.wrapping_add(1);
+            state.serial = self.serial;
+        }
+        state
+    }
+
+    /// Whether `other` reports the same state, the serial aside, in any
+    /// order: the same monitors with the same modes and properties, the
+    /// same logical monitors with the same primary, and the same
+    /// properties.
+    fn reports_same(&self, other: &DisplayManager) -> bool {
+        same_elements(&self.monitors, &other.monitors, Monitor::reports_same)
+            && same_elements(
+                &self.logical_monitors,
+                &other.logical_monitors,
+                LogicalMonitor::reports_same,
+            )
+            && self.properties == other.properties
+    }
 }
 
-/// Whether `a` and `b` hold the same elements, in any order.
-fn same_set<T: Eq + Hash>(a: &[T], b: &[T]) -> bool {
-    a.iter().collect::<HashSet<_>>() == b.iter().collect::<HashSet<_>>()
+/// Whether `a` and `b` hold the same elements by `same`, in any order. Each
+/// list names a connector at most once, so equal lengths and a match in `b`
+/// for every element of `a` make the same set.
+fn same_elements<T>(a: &[T], b: &[T], same: impl Fn(&T, &T) -> bool) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.iter().any(|y| same(x, y)))
 }
 
 /// Whether `a` and `b` are the same monitors (connector, vendor, product and
@@ -1718,13 +1765,25 @@ mod hotplug_tests {
     /// A sway output named `connector`, active at `x` with `scale`, in mode
     /// `width`x1080.
     fn sway_output(connector: &str, x: i32, scale: f64, width: i32) -> Output {
+        sway_output_with_modes(connector, x, scale, width, &[1920, 1280])
+    }
+
+    /// [`sway_output`], with modes of these widths (x1080), in this order.
+    fn sway_output_with_modes(
+        connector: &str,
+        x: i32,
+        scale: f64,
+        width: i32,
+        widths: &[i32],
+    ) -> Output {
+        let modes: Vec<_> = widths
+            .iter()
+            .map(|w| serde_json::json!({"width": w, "height": 1080, "refresh": 60000}))
+            .collect();
         serde_json::from_value(serde_json::json!({
             "id": 1, "name": connector, "make": "Acme", "model": connector, "serial": "0",
             "active": true, "dpms": true, "primary": false, "scale": scale, "transform": "normal",
-            "modes": [
-                {"width": 1920, "height": 1080, "refresh": 60000},
-                {"width": 1280, "height": 1080, "refresh": 60000}
-            ],
+            "modes": modes,
             "current_mode": {"width": width, "height": 1080, "refresh": 60000},
             "rect": {"x": x, "y": 0, "width": width, "height": 1080}
         }))
@@ -1735,8 +1794,8 @@ mod hotplug_tests {
         DisplayManager::monitors_of(outputs)
     }
 
-    /// A manager that has reported `outputs`, at serial 1.
-    fn reported(outputs: &[Output]) -> DisplayManager {
+    /// A manager that has stored `outputs`, and the state reported for them.
+    fn reported(outputs: &[Output]) -> (DisplayManager, DisplayManager) {
         let mut manager = DisplayManager {
             serial: 0,
             monitors: Vec::new(),
@@ -1745,8 +1804,17 @@ mod hotplug_tests {
         };
         let (monitors, logical_monitors) = state(outputs);
         assert!(manager.update(monitors, logical_monitors));
-        assert_eq!(manager.serial, 1);
-        manager
+        let last = manager.report(None, None);
+        (manager, last)
+    }
+
+    /// Report the manager's state after `last`, check that the serial moved
+    /// on, and that it stays while nothing changes. Returns the new report.
+    fn serial_moves(manager: &mut DisplayManager, last: &DisplayManager) -> DisplayManager {
+        let next = manager.report(None, Some(last));
+        assert_ne!(next.serial, last.serial);
+        assert_eq!(manager.report(None, Some(&next)).serial, next.serial);
+        next
     }
 
     /// The models of the monitors, which [`sway_output`] names after the
@@ -1769,21 +1837,21 @@ mod hotplug_tests {
 
     #[test]
     fn an_unplugged_monitor_is_noticed() {
-        let mut manager = reported(&[dp1(), dp2()]);
+        let (mut manager, last) = reported(&[dp1(), dp2()]);
         let (monitors, logical_monitors) = state(&[dp1()]);
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(connectors(&manager), ["DP-1"]);
         assert_eq!(manager.logical_monitors.len(), 1);
-        assert_eq!(manager.serial, 2);
+        serial_moves(&mut manager, &last);
     }
 
     #[test]
     fn a_plugged_in_monitor_is_noticed() {
-        let mut manager = reported(&[dp1()]);
+        let (mut manager, last) = reported(&[dp1()]);
         let (monitors, logical_monitors) = state(&[dp1(), dp2()]);
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(connectors(&manager), ["DP-1", "DP-2"]);
-        assert_eq!(manager.serial, 2);
+        serial_moves(&mut manager, &last);
     }
 
     #[test]
@@ -1795,7 +1863,7 @@ mod hotplug_tests {
             output.active = false;
             output
         };
-        let mut manager = reported(&[dp1(), disabled_dp2()]);
+        let (mut manager, last) = reported(&[dp1(), disabled_dp2()]);
         assert_eq!(manager.logical_monitors.len(), 1);
         let (monitors, logical_monitors) = state(&[dp1(), disabled_dp2()]);
         assert_eq!(logical_monitors.len(), 1);
@@ -1803,20 +1871,20 @@ mod hotplug_tests {
         let (monitors, logical_monitors) = state(&[dp1()]);
         assert!(manager.update(monitors, logical_monitors));
         assert_eq!(connectors(&manager), ["DP-1"]);
-        assert_eq!(manager.serial, 2);
+        serial_moves(&mut manager, &last);
     }
 
     #[test]
     fn the_same_outputs_in_another_order_are_no_change() {
-        let mut manager = reported(&[dp1(), dp2()]);
+        let (mut manager, last) = reported(&[dp1(), dp2()]);
         let (monitors, logical_monitors) = state(&[dp2(), dp1()]);
         assert!(!manager.update(monitors, logical_monitors));
-        assert_eq!(manager.serial, 1);
+        assert_eq!(manager.report(None, Some(&last)).serial, last.serial);
     }
 
     #[test]
-    fn a_new_layout_or_mode_is_a_change() {
-        let mut manager = reported(&[dp1(), dp2()]);
+    fn a_new_layout_or_mode_moves_the_serial_on() {
+        let (mut manager, mut last) = reported(&[dp1(), dp2()]);
         for changed in [
             sway_output("DP-2", 0, 1.0, 1920),    // moved
             sway_output("DP-2", 1920, 2.0, 1920), // scaled
@@ -1824,33 +1892,91 @@ mod hotplug_tests {
         ] {
             let (monitors, logical_monitors) = state(&[dp1(), changed]);
             assert!(manager.update(monitors, logical_monitors));
-            // The same monitors: a configuration for them is still valid.
-            assert_eq!(manager.serial, 1);
+            last = serial_moves(&mut manager, &last);
         }
     }
 
     #[test]
+    fn the_serial_moves_on_when_the_change_is_reported() {
+        let (mut manager, last) = reported(&[dp1(), dp2()]);
+        let (monitors, logical_monitors) = state(&[dp1(), sway_output("DP-2", 1920, 2.0, 1920)]);
+        assert!(manager.update(monitors, logical_monitors));
+        // Not yet reported: the serial last reported is still the one.
+        assert_eq!(manager.serial, last.serial);
+        serial_moves(&mut manager, &last);
+    }
+
+    #[test]
+    fn a_change_undone_before_it_is_reported_keeps_the_serial() {
+        let (mut manager, last) = reported(&[dp1(), dp2()]);
+        let (monitors, logical_monitors) = state(&[dp1(), sway_output("DP-2", 1920, 2.0, 1920)]);
+        assert!(manager.update(monitors, logical_monitors));
+        let (monitors, logical_monitors) = state(&[dp1(), dp2()]);
+        assert!(manager.update(monitors, logical_monitors));
+        assert_eq!(manager.report(None, Some(&last)).serial, last.serial);
+    }
+
+    #[test]
+    fn another_mode_list_is_a_change() {
+        // The current mode and the layout stay; only the list of modes
+        // changes: a mode that is not current is added, then the modes
+        // are listed in another order.
+        let (mut manager, mut last) = reported(&[dp1(), dp2()]);
+        for changed in [
+            sway_output_with_modes("DP-2", 1920, 1.0, 1920, &[1920, 1280, 1024]),
+            sway_output_with_modes("DP-2", 1920, 1.0, 1920, &[1024, 1280, 1920]),
+        ] {
+            let (monitors, logical_monitors) = state(&[dp1(), changed]);
+            assert!(manager.update(monitors, logical_monitors));
+            last = serial_moves(&mut manager, &last);
+        }
+    }
+
+    #[test]
+    fn the_reported_primary_alone_is_a_change() {
+        let (mut manager, _) = reported(&[dp1(), dp2()]);
+        let last = manager.report(Some("DP-1"), None);
+        let next = manager.report(Some("DP-2"), Some(&last));
+        assert_ne!(next.serial, last.serial);
+        assert_eq!(
+            manager.report(Some("DP-2"), Some(&next)).serial,
+            next.serial
+        );
+    }
+
+    #[test]
+    fn sways_primary_flag_alone_is_no_change() {
+        let (mut manager, last) = reported(&[dp1(), dp2()]);
+        let mut flagged = dp2();
+        flagged.primary = true;
+        let (monitors, logical_monitors) = state(&[dp1(), flagged]);
+        assert!(!manager.update(monitors, logical_monitors));
+        assert_eq!(manager.report(None, Some(&last)).serial, last.serial);
+    }
+
+    #[test]
     fn a_mode_change_is_always_noticed() {
-        // Each HashSet hashes with new random keys. A monitor in another mode
-        // that compared equal but hashed differently was missed whenever the
-        // two hashes happened to match closely enough (about 1 in 128).
+        // When changes were compared in HashSets, each with new random keys,
+        // a monitor in another mode that compared equal but hashed
+        // differently was missed whenever the two hashes happened to match
+        // closely enough (about 1 in 128).
         for _ in 0..1000 {
-            let mut manager = reported(&[dp1()]);
+            let (mut manager, last) = reported(&[dp1()]);
             let (monitors, logical_monitors) = state(&[sway_output("DP-1", 0, 1.0, 1280)]);
             assert!(manager.update(monitors, logical_monitors));
-            assert_eq!(manager.serial, 1);
+            assert_ne!(manager.report(None, Some(&last)).serial, last.serial);
         }
     }
 
     #[test]
     fn outputs_that_swap_places_are_a_change() {
-        let mut manager = reported(&[dp1(), dp2()]);
+        let (mut manager, last) = reported(&[dp1(), dp2()]);
         let (monitors, logical_monitors) = state(&[
             sway_output("DP-1", 1920, 1.0, 1920),
             sway_output("DP-2", 0, 1.0, 1920),
         ]);
         assert!(manager.update(monitors, logical_monitors));
-        assert_eq!(manager.serial, 1);
+        serial_moves(&mut manager, &last);
         let (monitors, logical_monitors) = state(&[
             sway_output("DP-1", 1920, 1.0, 1920),
             sway_output("DP-2", 0, 1.0, 1920),

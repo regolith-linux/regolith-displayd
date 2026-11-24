@@ -187,6 +187,15 @@ impl Monitor {
     pub fn same_monitor(&self, other: &Monitor) -> bool {
         self.description == other.description
     }
+
+    /// Whether `other` is reported exactly like this monitor: the same
+    /// description and properties, and the same modes in the same order,
+    /// every field of every mode included, current or not.
+    pub fn reports_same(&self, other: &Monitor) -> bool {
+        self.description == other.description
+            && self.modes == other.modes
+            && self.properties == other.properties
+    }
 }
 
 impl PartialEq for Monitor {
@@ -219,6 +228,20 @@ impl LogicalMonitor {
             self.transform,
             &self.monitors,
         )
+    }
+
+    /// Whether `other` has the same layout: the same state (see
+    /// [`LogicalMonitor::state`]) and properties. The primary flag is left
+    /// out, because sway's own flag is not the one reported:
+    /// `GetCurrentState` works out the primary itself.
+    pub fn same_layout(&self, other: &LogicalMonitor) -> bool {
+        self.state() == other.state() && self.properties == other.properties
+    }
+
+    /// Whether `other` is reported exactly like this logical monitor: the
+    /// same layout, and primary or not alike.
+    pub fn reports_same(&self, other: &LogicalMonitor) -> bool {
+        self.same_layout(other) && self.primary == other.primary
     }
 }
 

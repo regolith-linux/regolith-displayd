@@ -1,0 +1,251 @@
+#!/bin/bash
+# X programs must see the primary display that regolith-displayd reports: on
+# a headless sway that starts Xwayland on demand, the RandR primary output of
+# Xwayland must follow the primary of GetCurrentState at start, after a
+# temporary Apply, after a persistent one kept with Enter or reverted with
+# Escape, after the primary output is unplugged, after Xwayland is replaced
+# and after regolith-displayd is restarted. regolith-displayd must never be
+# what starts Xwayland, and a primary that an X client chose must stand until
+# the next change.
+set -euo pipefail
+
+work=$(mktemp -d)
+export HOME="$work/home" XDG_RUNTIME_DIR="$work/run"
+mkdir -p "$HOME"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+export WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1
+unset WAYLAND_DISPLAY SWAYSOCK I3SOCK DISPLAY DBUS_SESSION_BUS_ADDRESS
+pids=()
+
+cleanup() {
+    if [ -n "${displayd:-}" ]; then
+        pkill -P "$displayd" -x kanshi 2>/dev/null || true
+    fi
+    kill "${holder:-}" "${pids[@]}" 2>/dev/null || true
+    wait 2>/dev/null || true
+    rm -rf "$work"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*"
+    for log in "$work"/*.log; do
+        echo "--- $log"
+        tail -n 40 "$log"
+    done
+    exit 1
+}
+
+# retry <tries, 0.5 s apart> <command...>
+retry() {
+    local tries=$1
+    shift
+    for _ in $(seq "$tries"); do
+        if "$@"; then return 0; fi
+        sleep 0.5
+    done
+    return 1
+}
+
+dc() {
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+        --object-path /org/gnome/Mutter/DisplayConfig \
+        --method "org.gnome.Mutter.DisplayConfig.$1" "${@:2}"
+}
+
+serial() {
+    dc GetCurrentState | sed -E 's/^\(uint32 ([0-9]+),.*/\1/'
+}
+
+# The connector of the logical monitor GetCurrentState marks as primary.
+reported_primary() {
+    dc GetCurrentState | grep -oE "[0-9.]+, (uint32 )?[0-9]+, true, \[\('[^']+'" \
+        | sed -E "s/.*\('([^']+)'$/\1/"
+}
+
+# layout <primary>: sway's active outputs side by side, in sway's order and
+# their current modes, with <primary> as the primary monitor.
+layout() {
+    swaymsg -t get_outputs | python3 -c '
+import json, sys
+x, parts = 0, []
+for out in json.load(sys.stdin):
+    if not out["active"]:
+        continue
+    mode = out["current_mode"]
+    name = "%dx%d@%gHz" % (mode["width"], mode["height"], mode["refresh"] / 1000)
+    primary = "true" if out["name"] == sys.argv[1] else "false"
+    parts.append("(%d, 0, 1.0, 0, %s, [(%r, %r, @a{sv} {})])" % (x, primary, out["name"], name))
+    x += mode["width"]
+print("[" + ", ".join(parts) + "]")' "$1"
+}
+
+# apply <method> <primary>
+apply() {
+    dc ApplyMonitorsConfig "$(serial)" "$1" "$(layout "$2")" "@a{sv} {}" > /dev/null
+}
+
+# Answer a persistent change's confirmation prompt (see display-config-headless).
+answer() {
+    wtype -s 500 -k "$1"
+}
+
+# The pid of the Xwayland that serves our display, if one runs. An exited
+# one may stay a zombie until whatever adopted it reaps it.
+xwayland_pid() {
+    ps -C Xwayland -o pid=,stat=,args= \
+        | awk -v d="$DISPLAY" '$2 !~ /^Z/ {for (i = 4; i <= NF; i++) if ($i == d) print $1}'
+}
+
+xwayland_runs() {
+    [ -n "$(xwayland_pid)" ]
+}
+
+reported_primary_is() {
+    [ "$(reported_primary)" = "$1" ]
+}
+
+x_primary() {
+    xrandr --query 2> /dev/null | awk '$2 == "connected" && $3 == "primary" {print $1}'
+}
+
+x_primary_is() {
+    [ "$(x_primary)" = "$1" ]
+}
+
+# An X client that stays connected, so that Xwayland, started on demand,
+# keeps running between the checks.
+hold_x() {
+    xprop -root -spy _NET_SUPPORTED > /dev/null 2>&1 &
+    holder=$!
+    retry 40 xwayland_runs || fail "no X client could start Xwayland"
+}
+
+# expect <connector> <what happened>: GetCurrentState and the X server both
+# name <connector> as primary within 10 seconds.
+expect() {
+    retry 20 reported_primary_is "$1" \
+        || fail "GetCurrentState reports $(reported_primary) as primary, not $1, $2"
+    retry 20 x_primary_is "$1" || fail "the X primary is '$(x_primary)', not $1, $2"
+    echo "ok: $1 is the primary for sway and X $2"
+}
+
+start_displayd() {
+    RUST_LOG=info regolith-displayd >> "$work/displayd.log" 2>&1 &
+    displayd=$!
+    pids+=("$displayd")
+    retry 40 sh -c 'gdbus call --session --dest org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig --method org.gnome.Mutter.DisplayConfig.GetCurrentState 2> /dev/null | grep -q HEADLESS-1' \
+        || fail "regolith-displayd does not serve the headless outputs"
+}
+
+catches_sighup() {
+    local mask
+    mask=$(awk '$1 == "SigCgt:" {print $2}' "/proc/$1/status")
+    [ -n "$mask" ] && (( 0x$mask & 1 ))
+}
+
+command -v Xwayland > /dev/null || { echo "SKIP: Xwayland is not installed"; exit 77; }
+[ -d /tmp/.X11-unix ] || mkdir -m 1777 /tmp/.X11-unix 2> /dev/null || true
+
+printf 'xwayland enable\noutput HEADLESS-1 mode 1280x720 position 0 0\n' > "$work/sway.cfg"
+sway -c "$work/sway.cfg" > "$work/sway.log" 2>&1 &
+pids+=($!)
+retry 60 compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" > /dev/null || fail "sway did not start"
+SWAYSOCK=$(compgen -G "$XDG_RUNTIME_DIR/sway-ipc.*.sock" | head -n 1)
+export SWAYSOCK
+retry 20 swaymsg -t get_outputs > /dev/null || fail "sway IPC not ready"
+WAYLAND_DISPLAY=$(compgen -G "$XDG_RUNTIME_DIR/wayland-*" | grep -v '\.lock$' | head -n 1)
+WAYLAND_DISPLAY=${WAYLAND_DISPLAY##*/}
+[ -n "$WAYLAND_DISPLAY" ] || fail "sway created no wayland socket"
+export WAYLAND_DISPLAY
+
+# sway gives its X display to the programs it starts, and listens on it
+# before Xwayland runs.
+swaymsg -q exec "printenv DISPLAY > $work/display"
+retry 20 test -s "$work/display" || { echo "SKIP: sway opened no X display (no Xwayland support?)"; exit 77; }
+DISPLAY=$(cat "$work/display")
+export DISPLAY
+echo "X display $DISPLAY"
+! xwayland_runs || fail "Xwayland runs before any X client connected"
+
+{ swaymsg -q create_output && swaymsg -q create_output; } || fail "sway cannot create headless outputs"
+retry 20 sh -c '[ "$(swaymsg -t get_outputs | grep -c "\"name\": \"HEADLESS-")" = 3 ]' || fail "no three headless outputs"
+read -r big small < <(swaymsg -t get_outputs | python3 -c 'import json, sys; print(" ".join(sorted(o["name"] for o in json.load(sys.stdin) if o["name"] != "HEADLESS-1")))')
+swaymsg -q output "$big" mode 1920x1080 position 1280 0
+swaymsg -q output "$small" mode 1024x768 position 3200 0
+echo "sway outputs: HEADLESS-1 1280x720, $big 1920x1080, $small 1024x768"
+
+dbus-daemon --session --nofork --print-address=1 > "$work/bus" 2> "$work/dbus.log" &
+pids+=($!)
+retry 20 test -s "$work/bus" || fail "dbus-daemon did not start"
+DBUS_SESSION_BUS_ADDRESS=$(head -n 1 "$work/bus")
+export DBUS_SESSION_BUS_ADDRESS
+
+regolith-displayd-init > /dev/null
+kanshi -c "$HOME/.config/regolith3/kanshi/config" > "$work/kanshi.log" 2>&1 &
+kanshi=$!
+pids+=("$kanshi")
+sleep 1
+kill -0 "$kanshi" || fail "kanshi did not start"
+if ! catches_sighup "$kanshi" && systemctl --user show-environment > /dev/null 2>&1; then
+    echo "SKIP: a kept Apply would restart kanshi through regolith-init-kanshi.service, outside this test session"
+    exit 77
+fi
+
+start_displayd
+[ "$(reported_primary)" = "$big" ] || fail "GetCurrentState reports $(reported_primary) as primary, not the largest output $big"
+sleep 3
+! xwayland_runs || fail "regolith-displayd started Xwayland"
+echo "ok: regolith-displayd does not start Xwayland"
+
+hold_x
+if ! xrandr --query | grep -q "^HEADLESS-1 connected"; then
+    echo "SKIP: this Xwayland does not name its outputs after sway's: $(xrandr --query | grep ' connected' | tr '\n' ' ')"
+    exit 77
+fi
+expect "$big" "once an X client started Xwayland"
+
+apply 1 "$small" || fail "a temporary Apply making $small primary failed"
+expect "$small" "after a temporary Apply"
+
+# A primary chosen by an X client stands until the next change.
+xrandr --output HEADLESS-1 --primary
+x_primary_is HEADLESS-1 || fail "xrandr could not make HEADLESS-1 primary"
+sleep 5
+x_primary_is HEADLESS-1 || fail "regolith-displayd replaced the primary an X client chose with '$(x_primary)'"
+echo "ok: the primary an X client chose stands while nothing changes"
+apply 1 "$small" || fail "a repeated temporary Apply failed"
+expect "$small" "after the next Apply"
+
+apply 2 HEADLESS-1 || fail "a persistent Apply making HEADLESS-1 primary failed"
+answer Escape || fail "could not press Escape at the prompt"
+expect "$small" "after a persistent change was reverted with Escape"
+
+apply 2 HEADLESS-1 || fail "a persistent Apply making HEADLESS-1 primary failed"
+answer Return || fail "could not press Enter at the prompt"
+expect HEADLESS-1 "after a persistent change was kept"
+
+# Xwayland exits and an X client starts a new one.
+old=$(xwayland_pid)
+kill "$holder"
+kill "$old"
+retry 20 eval '! xwayland_runs' || fail "Xwayland $old did not exit"
+hold_x
+[ "$(xwayland_pid)" != "$old" ] || fail "Xwayland was not replaced"
+expect HEADLESS-1 "in the new Xwayland"
+
+# A restarted regolith-displayd brings back the kept choice, even against a
+# primary an X client set while it was away.
+kill "$displayd"
+wait "$displayd" 2> /dev/null || true
+xrandr --output "$big" --primary
+start_displayd
+expect HEADLESS-1 "after regolith-displayd restarted"
+
+if swaymsg output HEADLESS-1 unplug > "$work/unplug.log" 2>&1; then
+    expect "$big" "after HEADLESS-1 was unplugged"
+else
+    # sway 1.7 (Ubuntu 22.04) has no "output unplug".
+    echo "note: sway cannot unplug a headless output here, unplug check skipped: $(tr '\n' ' ' < "$work/unplug.log")"
+fi
+echo "PASS"

@@ -5,6 +5,7 @@ pub mod labels;
 pub mod modes;
 pub mod monitor;
 pub mod night_light;
+pub mod xwayland;
 
 use core::fmt;
 use lazy_static::lazy_static;
@@ -50,6 +51,15 @@ const PROMPT_READY_TIMEOUT: Duration = Duration::from_secs(3);
 /// change has replaced is ignored.
 static CONFIRMATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Counts the changes this daemon answers to: applies, answers to the
+/// confirmation prompt, and new outputs from sway. [`xwayland`] sets the X
+/// primary again after each of them, even when the primary stays the same.
+static DISPLAY_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+fn display_event() {
+    DISPLAY_EVENTS.fetch_add(1, Ordering::AcqRel);
+}
+
 /// A persistent change awaiting the user's answer. Dropping it cancels the
 /// confirmation and closes its prompt.
 struct Pending {
@@ -94,6 +104,48 @@ pub struct DisplayServer {
     primary: Arc<Mutex<Option<PrimaryChoice>>>,
 }
 
+/// What decides the primary monitor that `GetCurrentState` reports: the
+/// state the watcher keeps, and the primary chosen by the last Apply.
+#[derive(Clone)]
+pub struct PrimarySource {
+    manager: Arc<Mutex<DisplayManager>>,
+    primary: Arc<Mutex<Option<PrimaryChoice>>>,
+}
+
+impl PrimarySource {
+    /// The state as `GetCurrentState` reports it, and the connector of its
+    /// primary monitor (None with no monitor on): the choice of the last
+    /// Apply if it was made for the monitors connected now, else the primary
+    /// saved with their profile, else the fallback of
+    /// [`DisplayManager::mark_primary`]. The profiles are looked for in
+    /// `paths`, or where [`get_kanshi_paths`] says.
+    pub async fn reported(&self, paths: Option<&KanshiPaths>) -> (DisplayManager, Option<String>) {
+        let mut state = self.manager.lock().await.clone();
+        let remembered = self.primary.lock().await.clone();
+        let chosen = match &remembered {
+            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
+                Some(connector.clone())
+            }
+            _ => match paths {
+                Some(paths) => state.saved_primary(paths),
+                None => match get_kanshi_paths().await {
+                    Ok(paths) => state.saved_primary(&paths),
+                    Err(_) => None,
+                },
+            },
+        };
+        let primary = state.mark_primary(chosen.as_deref());
+        (state, primary)
+    }
+
+    /// How many changes this daemon has answered to so far (see
+    /// [`DISPLAY_EVENTS`]). Read it before [`Self::reported`]: a change that
+    /// comes after is then seen as a new one.
+    pub fn events(&self) -> u64 {
+        DISPLAY_EVENTS.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
 #[zvariant(signature = "dict")]
 pub struct DisplayManagerProperties {
@@ -121,19 +173,7 @@ pub struct KanshiPaths {
 impl DisplayServer {
     pub async fn get_current_state(&mut self) -> DisplayManager {
         info!("Recieved 'GetCurrentState' request from control-center");
-        let mut state = self.manager.lock().await.clone();
-        let remembered = self.primary.lock().await.clone();
-        let chosen = match &remembered {
-            Some((set, connector)) if *set == monitor_set(&state.monitors) => {
-                Some(connector.clone())
-            }
-            _ => match get_kanshi_paths().await {
-                Ok(paths) => state.saved_primary(&paths),
-                Err(_) => None,
-            },
-        };
-        state.mark_primary(chosen.as_deref());
-        state
+        self.primary_source().reported(None).await.0
     }
 
     /// Verify (0), or apply at once, temporarily (1) or persistently (2).
@@ -256,6 +296,7 @@ impl DisplayServer {
             .lock()
             .await
             .replace((monitor_set(&manager_obj.monitors), primary));
+        display_event();
         let mut ready = None;
         if method == 2 {
             let id = CONFIRMATIONS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -322,6 +363,16 @@ impl DisplayServer {
             primary: Arc::new(Mutex::new(None)),
         }
     }
+
+    /// What decides the primary monitor this server reports, for
+    /// [`xwayland`] to follow.
+    pub fn primary_source(&self) -> PrimarySource {
+        PrimarySource {
+            manager: Arc::clone(&self.manager),
+            primary: Arc::clone(&self.primary),
+        }
+    }
+
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
         // kanshi starts after this daemon: make sure it can load the profiles,
@@ -376,6 +427,7 @@ impl DisplayManager {
             // A monitor that went away is a change too.
             let changed = manager_obj_lock.update(display_info.0.clone(), display_info.1.clone());
             if changed {
+                display_event();
                 debug!("monitors info: {:#?}", manager_obj_lock.monitors);
                 debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
             }
@@ -499,8 +551,9 @@ impl DisplayManager {
 
     /// Mark exactly one logical monitor as primary, as Mutter always does:
     /// the `chosen` monitor if it is on, else the built-in panel, else the
-    /// monitor with the largest mode (the first of them on a tie).
-    fn mark_primary(&mut self, chosen: Option<&str>) {
+    /// monitor with the largest mode (the first of them on a tie). Returns
+    /// its connector, None if no monitor is on.
+    fn mark_primary(&mut self, chosen: Option<&str>) -> Option<String> {
         let active: Vec<&Monitor> = self
             .monitors
             .iter()
@@ -526,6 +579,18 @@ impl DisplayManager {
             let is_primary = Some(logical.connector()) == primary.as_deref();
             logical.set_primary(is_primary);
         }
+        primary
+    }
+
+    /// The connectors of the monitors that are on, sorted.
+    fn active_connectors(&self) -> Vec<String> {
+        let mut active: Vec<String> = self
+            .logical_monitors
+            .iter()
+            .map(|logical| logical.connector().to_string())
+            .collect();
+        active.sort();
+        active
     }
 
     /// The sway commands that apply `config`: the outputs it names are
@@ -2134,6 +2199,7 @@ impl Confirmation {
                 Err(e) => error!("Error getting output information from sway: {e}"),
             }
         }
+        display_event();
         drop(manager_obj);
         if let Err(e) = DisplayManager::emit_monitors_changed().await {
             error!("Error emitting MonitorsChanged: {e}");

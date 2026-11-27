@@ -26,6 +26,7 @@ Run the daemon with the command specified above. You can then use `gnome-control
 * Scale
 * Hotplugging monitors
 * Night Light (needs gnome-settings-daemon's color plugin running in the session and a compositor with `wlr-gamma-control`, such as sway)
+* Primary display, for X programs too: the RandR primary output of the session's Xwayland (the X server `DISPLAY` names) follows the primary display chosen in Settings, as in GNOME
 
 # Monitor number labels
 While its window is active, the Displays panel asks the shell to show each monitor's number on that monitor (`ShowMonitorLabels` and `HideMonitorLabels` of `org.gnome.Shell`). In the sway session `regolith-powerd` owns `org.gnome.Shell` and passes these calls on to this daemon, which draws the labels. The daemon serves the same two methods, with the same arguments, on its own bus name `org.gnome.Mutter.DisplayConfig` at `/org/regolith/displayd/MonitorLabels`, interface `org.regolith.displayd.MonitorLabels`. This interface is internal to Regolith and may change together with `regolith-powerd`.
